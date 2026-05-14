@@ -39,39 +39,53 @@ impl P2pPool {
         + 8   // cumulative_payouts_lamports
         + 1;  // accepting_deposits
 
-    /// Total value of the pool: available + collateral + unclaimed
+    /// Total value of the pool: available + collateral + unclaimed.
+    /// Used for the conservation invariant only (tracks physical lamports
+    /// minus rent). Not used as share-price denominator — see pool_equity.
     pub fn total_value(&self) -> Option<u64> {
         self.available_lamports
             .checked_add(self.active_collateral_lamports)?
             .checked_add(self.unclaimed_payouts_lamports)
     }
 
-    /// Convert lamports to shares at current price
-    pub fn lamports_to_shares(&self, lamports: u64) -> u64 {
-        if self.total_shares == 0 || self.total_value().unwrap_or(0) == 0 {
-            return lamports; // 1:1 when pool is empty
-        }
-        let total = self.total_value().unwrap_or(1);
-        // shares = lamports * total_shares / total_value
-        (lamports as u128)
-            .checked_mul(self.total_shares as u128)
-            .unwrap_or(0)
-            .checked_div(total as u128)
-            .unwrap_or(0) as u64
+    /// Writer equity = available + active_collateral. Excludes unclaimed_payouts,
+    /// which are committed outflows to buyers and not pool equity.
+    ///
+    /// Equity is INVARIANT under claim_p2p: claim transfers payout out of pool
+    /// AND decrements unclaimed_payouts by the same amount, leaving avail and
+    /// active untouched. Using equity as the share-price denominator means
+    /// new depositors are not diluted by pending buyer payouts.
+    pub fn pool_equity(&self) -> Option<u64> {
+        self.available_lamports
+            .checked_add(self.active_collateral_lamports)
     }
 
-    /// Convert shares to lamports at current price
+    /// Convert lamports to shares at current price (uses pool equity).
+    pub fn lamports_to_shares(&self, lamports: u64) -> u64 {
+        let equity = self.pool_equity().unwrap_or(0);
+        if self.total_shares == 0 || equity == 0 {
+            return lamports; // 1:1 when pool is empty
+        }
+        // shares = lamports * total_shares / equity
+        (lamports as u128)
+            .checked_mul(self.total_shares as u128)
+            .and_then(|n| n.checked_div(equity as u128))
+            .and_then(|v| u64::try_from(v).ok())
+            .unwrap_or(0)
+    }
+
+    /// Convert shares to lamports at current price (uses pool equity).
     pub fn shares_to_lamports(&self, shares: u64) -> u64 {
         if self.total_shares == 0 {
             return 0;
         }
-        let total = self.total_value().unwrap_or(0);
-        // lamports = shares * total_value / total_shares
+        let equity = self.pool_equity().unwrap_or(0);
+        // lamports = shares * equity / total_shares
         (shares as u128)
-            .checked_mul(total as u128)
+            .checked_mul(equity as u128)
+            .and_then(|n| n.checked_div(self.total_shares as u128))
+            .and_then(|v| u64::try_from(v).ok())
             .unwrap_or(0)
-            .checked_div(self.total_shares as u128)
-            .unwrap_or(0) as u64
     }
 
     /// Sync tracked balances with actual PDA lamports.

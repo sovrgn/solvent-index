@@ -273,6 +273,10 @@ pub fn handler<'info>(
         .vault_premiums_collected
         .checked_add(vault_premium)
         .ok_or(MhiError::Overflow)?;
+    cohort.outstanding_positions = cohort
+        .outstanding_positions
+        .checked_add(1)
+        .ok_or(MhiError::Overflow)?;
 
     // Initialize position
     let position = &mut ctx.accounts.position;

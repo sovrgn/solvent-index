@@ -101,6 +101,8 @@ pub fn handler(ctx: Context<StartCohort>) -> Result<()> {
     cohort.p2p_positions_settled = 0;
     cohort.p2p_strike_collateral = [0u64; crate::constants::NUM_STRIKES];
     cohort.positions_voided = 0;
+    cohort.outstanding_positions = 0;
+    cohort.outstanding_p2p_positions = 0;
 
     // Update global state
     gs.active_cohorts = gs.active_cohorts.checked_add(1).ok_or(MhiError::Overflow)?;

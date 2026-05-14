@@ -234,6 +234,9 @@ pub fn handler(
     cohort.strike_volume_lamports[strike_idx] = cohort.strike_volume_lamports[strike_idx]
         .checked_add(size_lamports)
         .ok_or(MhiError::Overflow)?;
+    cohort.outstanding_p2p_positions = cohort.outstanding_p2p_positions
+        .checked_add(1)
+        .ok_or(MhiError::Overflow)?;
 
     let pos = &mut ctx.accounts.p2p_position;
     pos.bump = ctx.bumps.p2p_position;

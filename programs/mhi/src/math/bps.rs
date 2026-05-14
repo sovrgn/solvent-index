@@ -112,7 +112,8 @@ pub fn clamp_delta_bps(value: u32, reference: u32, delta_bps: u32) -> u32 {
         / (BPS_DENOMINATOR as u64);
     let max_move = max_move as u32;
 
-    // Floor at 5000 BPS (0.5x) to prevent keeper-driven collapse
+    // Floor at MHI_ABSOLUTE_FLOOR_BPS (currently 0.1x = 1000 BPS) to prevent
+    // keeper-driven collapse below a hard absolute minimum.
     let lower = reference.saturating_sub(max_move).max(crate::constants::MHI_ABSOLUTE_FLOOR_BPS);
     let upper = reference.saturating_add(max_move);
 
@@ -319,21 +320,23 @@ mod tests {
     #[test]
     fn test_clamp_delta_walk_down_hits_floor() {
         // Simulate compromised keeper submitting 1 every cohort with 33% clamp.
-        // Starting from 12680, MHI should walk down but never go below 5000 (absolute floor).
+        // Starting from 12680, MHI walks down but never goes below
+        // MHI_ABSOLUTE_FLOOR_BPS (1000 = 0.1x).
+        let floor = crate::constants::MHI_ABSOLUTE_FLOOR_BPS;
         let mut mhi = 12_680u32;
         let mut cohorts = 0u32;
-        while mhi > 5_000 {
+        while mhi > floor {
             mhi = clamp_delta_bps(1, mhi, 3_300);
             cohorts += 1;
             assert!(cohorts < 50, "should converge, stuck at {mhi}");
         }
-        // Should hit the floor at exactly 5000
-        assert_eq!(mhi, 5_000);
-        // Should take 3+ cohorts to walk from 12680 to floor
+        // Should hit the floor exactly
+        assert_eq!(mhi, floor);
+        // Should take multiple cohorts to walk from 12680 to floor
         assert!(cohorts >= 3, "only took {cohorts} cohorts, expected >= 3");
-        // One more attempt - should stay at 5000
+        // One more attempt - should stay at floor
         let floored = clamp_delta_bps(1, mhi, 3_300);
-        assert_eq!(floored, 5_000, "MHI must not go below absolute floor");
+        assert_eq!(floored, floor, "MHI must not go below absolute floor");
     }
 
     #[test]
@@ -360,13 +363,18 @@ mod tests {
     }
 
     #[test]
-    fn test_clamp_delta_floor_at_5000() {
-        // Lower bound can't go below MHI_ABSOLUTE_FLOOR_BPS (5000)
-        // ref=100, delta=3300: max_move = 33. lower = max(100-33, 5000) = 5000
-        assert_eq!(clamp_delta_bps(1, 100, 3_300), 5_000);
-        // ref=6000, delta=3300: max_move = 1980. lower = max(6000-1980, 5000) = 5000
-        assert_eq!(clamp_delta_bps(1, 6_000, 3_300), 5_000);
-        // ref=10000, delta=3300: max_move = 3300. lower = max(10000-3300, 5000) = 6700
+    fn test_clamp_delta_floor_at_absolute_minimum() {
+        // Lower bound is clamped to MHI_ABSOLUTE_FLOOR_BPS (currently 1000 = 0.1x).
+        let floor = crate::constants::MHI_ABSOLUTE_FLOOR_BPS;
+        assert_eq!(floor, 1_000, "test assumes MHI_ABSOLUTE_FLOOR_BPS = 1000");
+
+        // ref=100, delta=3300: max_move = 33. lower = max(100-33=67, 1000) = 1000.
+        assert_eq!(clamp_delta_bps(1, 100, 3_300), floor);
+        // ref=1500, delta=3300: max_move = 495. lower = max(1500-495=1005, 1000) = 1005.
+        assert_eq!(clamp_delta_bps(1, 1_500, 3_300), 1_005);
+        // ref=6000, delta=3300: max_move = 1980. lower = max(6000-1980=4020, 1000) = 4020.
+        assert_eq!(clamp_delta_bps(1, 6_000, 3_300), 4_020);
+        // ref=10000, delta=3300: max_move = 3300. lower = max(10000-3300=6700, 1000) = 6700.
         assert_eq!(clamp_delta_bps(1, 10_000, 3_300), 6_700);
     }
 

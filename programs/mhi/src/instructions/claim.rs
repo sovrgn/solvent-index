@@ -25,7 +25,9 @@ pub struct Claim<'info> {
     )]
     pub vault: Account<'info, Vault>,
 
-    /// The cohort this position belongs to (for event data).
+    /// The cohort this position belongs to. Mutable because we decrement
+    /// outstanding_positions when the Position PDA is closed below.
+    #[account(mut)]
     pub cohort: Account<'info, Cohort>,
 
     #[account(
@@ -69,8 +71,14 @@ pub fn handler(ctx: Context<Claim>) -> Result<()> {
         **ctx.accounts.owner.to_account_info().try_borrow_mut_lamports()? += payout;
     }
 
-    // The position account is closed by Anchor's `close = caller` constraint.
-    // This zeros data, transfers rent to caller, and reassigns owner to system program.
+    // The position account is closed by Anchor's `close = owner` constraint.
+    // Decrement outstanding-position counter so close_cohort can eventually fire.
+    ctx.accounts.cohort.outstanding_positions = ctx
+        .accounts
+        .cohort
+        .outstanding_positions
+        .checked_sub(1)
+        .ok_or(MhiError::Overflow)?;
 
     // Verify tracked total does not exceed actual lamports (sanity check).
     // Read vault fields directly to avoid borrow conflict.

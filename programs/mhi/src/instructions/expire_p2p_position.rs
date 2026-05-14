@@ -19,6 +19,7 @@ pub struct ExpireP2pPosition<'info> {
     )]
     pub p2p_pool: Account<'info, P2pPool>,
 
+    #[account(mut)]
     pub cohort: Account<'info, Cohort>,
 
     #[account(
@@ -48,6 +49,13 @@ pub fn handler(ctx: Context<ExpireP2pPosition>) -> Result<()> {
         .saturating_sub(unclaimed);
     pool.available_lamports = pool.available_lamports
         .checked_add(unclaimed)
+        .ok_or(MhiError::Overflow)?;
+
+    // Decrement outstanding-position counter so close_cohort can eventually fire.
+    let cohort = &mut ctx.accounts.cohort;
+    cohort.outstanding_p2p_positions = cohort
+        .outstanding_p2p_positions
+        .checked_sub(1)
         .ok_or(MhiError::Overflow)?;
 
     // Pool conservation check

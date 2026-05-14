@@ -68,6 +68,15 @@ pub struct Cohort {
 
     /// Number of vault positions voided (for batchable void_cohort)
     pub positions_voided: u32,
+
+    /// Count of Position PDAs still alive (incremented on buy_call,
+    /// decremented when the PDA is closed by claim or expire_position).
+    /// close_cohort requires this to be zero to prevent bricking unclaimed positions.
+    pub outstanding_positions: u32,
+
+    /// Count of P2pPosition PDAs still alive. Same lifecycle as outstanding_positions
+    /// but for the P2P side.
+    pub outstanding_p2p_positions: u32,
 }
 
 impl Cohort {
@@ -96,7 +105,9 @@ impl Cohort {
         + 4   // p2p_positions
         + 4   // p2p_positions_settled
         + (8 * NUM_STRIKES) // p2p_strike_collateral
-        + 4;  // positions_voided
+        + 4   // positions_voided
+        + 4   // outstanding_positions
+        + 4;  // outstanding_p2p_positions
 
     pub fn is_trading(&self) -> bool {
         self.status == CohortStatus::Trading
@@ -125,5 +136,11 @@ impl Cohort {
     /// Returns true if there are no positions of any kind.
     pub fn is_empty(&self) -> bool {
         self.total_positions == 0 && self.p2p_positions == 0
+    }
+
+    /// Returns true when every position PDA derived from this cohort has been
+    /// closed (via claim or expire). close_cohort uses this as its safety gate.
+    pub fn is_quiescent(&self) -> bool {
+        self.outstanding_positions == 0 && self.outstanding_p2p_positions == 0
     }
 }

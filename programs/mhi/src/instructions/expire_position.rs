@@ -18,6 +18,7 @@ pub struct ExpirePosition<'info> {
     )]
     pub vault: Account<'info, Vault>,
 
+    #[account(mut)]
     pub cohort: Account<'info, Cohort>,
 
     #[account(
@@ -62,6 +63,12 @@ pub fn handler(ctx: Context<ExpirePosition>) -> Result<()> {
     }
 
     // Position is closed by Anchor's `close = caller` constraint.
+    // Decrement outstanding-position counter so close_cohort can eventually fire.
+    let cohort = &mut ctx.accounts.cohort;
+    cohort.outstanding_positions = cohort
+        .outstanding_positions
+        .checked_sub(1)
+        .ok_or(MhiError::Overflow)?;
 
     emit!(PositionExpired {
         cohort_index: ctx.accounts.cohort.index,

@@ -36,28 +36,31 @@ pub struct CloseCohort<'info> {
 
 pub fn handler(ctx: Context<CloseCohort>) -> Result<()> {
     let cohort = &ctx.accounts.cohort;
-    let gs = &ctx.accounts.global_state;
+    let _gs = &ctx.accounts.global_state;
     let clock = Clock::get()?;
 
     // Must be settled or voided
     require!(cohort.is_resolved(), MhiError::InvalidCohortStatus);
 
-    // Must be past claim expiry window so all positions have been
-    // claimed or expired. This ensures no position PDA still references
-    // this cohort for claim/expire_position calls.
+    // Tight invariant: every Position / P2pPosition PDA derived from this cohort
+    // must have been closed (via claim or expire). Without this, close_cohort
+    // could brick still-open positions because claim and expire both require
+    // the Cohort account to deserialize.
     //
-    // settlement_deadline is the latest a cohort could have been settled.
-    // claim_expiry_seconds is the time window after settlement for claims.
-    // After both have passed, all positions are either claimed or expirable.
-    let earliest_close = cohort
-        .settlement_deadline
-        .checked_add(gs.claim_expiry_seconds as i64)
-        .ok_or(MhiError::Overflow)?;
+    // expire_position / expire_p2p_position are permissionless after
+    // claim_deadline (rent reward → caller), so unclaimed positions get
+    // cleaned up reliably regardless of buyer behaviour. The counter will
+    // reach zero on its own.
+    require!(cohort.is_quiescent(), MhiError::ClaimNotExpired);
+
+    // Soft floor: prevent close from running during an in-progress cohort
+    // even if some future bug zeroed the counter prematurely.
     require!(
-        clock.unix_timestamp >= earliest_close,
+        clock.unix_timestamp >= cohort.settlement_deadline,
         MhiError::ClaimNotExpired
     );
 
-    // Anchor's `close = caller` handles zeroing, rent refund, and owner reassignment.
+    // Anchor's `close = authority` handles zeroing, rent refund to authority,
+    // and owner reassignment to system program.
     Ok(())
 }

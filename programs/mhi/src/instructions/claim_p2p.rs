@@ -21,6 +21,7 @@ pub struct ClaimP2p<'info> {
     )]
     pub p2p_pool: Account<'info, P2pPool>,
 
+    #[account(mut)]
     pub cohort: Account<'info, Cohort>,
 
     #[account(
@@ -72,6 +73,13 @@ pub fn handler(ctx: Context<ClaimP2p>) -> Result<()> {
 
     let position = &mut ctx.accounts.p2p_position;
     position.claimed = true;
+
+    // Decrement outstanding-position counter so close_cohort can eventually fire.
+    let cohort = &mut ctx.accounts.cohort;
+    cohort.outstanding_p2p_positions = cohort
+        .outstanding_p2p_positions
+        .checked_sub(1)
+        .ok_or(MhiError::Overflow)?;
 
     // Pool conservation check
     {
