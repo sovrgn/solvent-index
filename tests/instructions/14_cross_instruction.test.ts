@@ -1,13 +1,12 @@
 import { expect } from "chai";
-import * as anchor from "@coral-xyz/anchor";
 import { SystemProgram } from "@solana/web3.js";
 import {
   setupProtocol, TestCtx, expectError,
   startCohort, buyCall, warpPastObservation, submitMhi, settleBatch,
   claimPosition, warpTime, warpToTimestamp, assertVaultConservation,
-  voidCohort, runFullCohort, SOL, getBalance, accountExists,
-  FAST_TRADING_WINDOW, FAST_MEASUREMENT, FAST_OBSERVATION,
-  FAST_SETTLEMENT_DEADLINE, FAST_CLAIM_EXPIRY,
+  voidCohort, runFullCohort, SOL, accountExists,
+  currentAtmStrike, currentLiveStrikes,
+  FAST_TRADING_WINDOW, FAST_CLAIM_EXPIRY,
   findPositionPda,
 } from "./_setup";
 
@@ -19,7 +18,7 @@ describe("cross-instruction state attacks", () => {
 
   describe("ordering exploits", () => {
     it("settle_batch on Settled cohort → InvalidCohortStatus", async () => {
-      const { cohort, positions } = await runFullCohort(t, 14_000, [{}], { skipClaim: true });
+      const { cohort, positions } = await runFullCohort(t, undefined, [{}], { skipClaim: true });
       await warpTime(t.context, 1);
       await expectError(
         () => settleBatch(t, cohort, positions),
@@ -29,8 +28,6 @@ describe("cross-instruction state attacks", () => {
     });
 
     it("settle_batch on Voided cohort → MhiNotSubmitted (first check)", async () => {
-      // Program checks MhiNotSubmitted before InvalidCohortStatus.
-      // A voided cohort has no MHI, so MhiNotSubmitted fires first.
       const cohort = await startCohort(t);
       const pos = await buyCall(t, cohort);
       await voidCohort(t, cohort, [pos]);
@@ -42,28 +39,27 @@ describe("cross-instruction state attacks", () => {
       await claimPosition(t, cohort, pos, t.buyer);
     });
 
-    it("submit_mhi on Settled cohort → InvalidCohortStatus (status check fires first)", async () => {
-      // Program checks status (Trading/Measuring) before MhiAlreadySubmitted.
-      // A Settled cohort fails the status check first.
+    it("submit_mhi on Settled cohort → InvalidCohortStatus", async () => {
       const cohort = await startCohort(t);
       await warpPastObservation(t.context);
-      await submitMhi(t, cohort, 12_000);
+      const atm = await currentAtmStrike(t);
+      await submitMhi(t, cohort, atm);
       await settleBatch(t, cohort, []);
-      // Now cohort is Settled
       await warpTime(t.context, 1);
       await expectError(
-        () => submitMhi(t, cohort, 13_000),
+        () => submitMhi(t, cohort, atm),
         "InvalidCohortStatus",
       );
     });
 
     it("buy_call on Measuring cohort → TradingWindowClosed", async () => {
       const cohort = await startCohort(t);
+      const atm = await currentAtmStrike(t);
       await warpTime(t.context, FAST_TRADING_WINDOW + 1);
-      const [posPda] = findPositionPda(t.program.programId, cohort, t.buyer.publicKey, 12_000, 0);
+      const [posPda] = findPositionPda(t.program.programId, cohort, t.buyer.publicKey, atm, 0);
       await expectError(
         () => t.program.methods
-          .buyCall(12_000, SOL(0.05), 0)
+          .buyCall(atm, SOL(0.05), 0)
           .accounts({
             buyer: t.buyer.publicKey,
             globalState: t.globalState,
@@ -80,9 +76,8 @@ describe("cross-instruction state attacks", () => {
       await voidCohort(t, cohort);
     });
 
-    it("start_cohort while unclaimed positions exist - succeeds (Idle after settle)", async () => {
-      await runFullCohort(t, 14_000, [{}], { skipClaim: true });
-      // Protocol is Idle (all settled), positions unclaimed but that doesn't block
+    it("start_cohort while unclaimed positions exist - succeeds (active_cohorts decrements after settle)", async () => {
+      await runFullCohort(t, undefined, [{}], { skipClaim: true });
       const cohort2 = await startCohort(t);
       expect(cohort2).to.not.be.null;
       await voidCohort(t, cohort2);
@@ -95,14 +90,15 @@ describe("cross-instruction state attacks", () => {
       const cohort = await startCohort(t);
       await buyCall(t, cohort);
       await assertVaultConservation(t);
-      await voidCohort(t, cohort, []); // void without refunding for cleanup
+      await voidCohort(t, cohort, []);
     });
 
     it("invariant holds after settle_batch", async () => {
       const cohort = await startCohort(t);
-      const pos = await buyCall(t, cohort);
+      const live = await currentLiveStrikes(t);
+      const pos = await buyCall(t, cohort, { strikeBps: live[2] });
       await warpPastObservation(t.context);
-      await submitMhi(t, cohort, 15_000);
+      await submitMhi(t, cohort, live[5]!); // ITM
       await settleBatch(t, cohort, [pos]);
       await assertVaultConservation(t);
       await claimPosition(t, cohort, pos, t.buyer);
@@ -134,13 +130,14 @@ describe("cross-instruction state attacks", () => {
       const availBefore = vaultBefore.availableLamports.toNumber();
 
       const cohort = await startCohort(t);
-      const pos = await buyCall(t, cohort, { strikeBps: 12_000 });
+      const live = await currentLiveStrikes(t);
+      const pos = await buyCall(t, cohort, { strikeBps: live[2] });
 
       const posData = await t.program.account.position.fetch(pos);
       const premium = posData.vaultPremiumLamports.toNumber();
 
       await warpPastObservation(t.context);
-      await submitMhi(t, cohort, 15_000); // ITM
+      await submitMhi(t, cohort, live[5]!); // ITM
       await settleBatch(t, cohort, [pos]);
 
       const posSettled = await t.program.account.position.fetch(pos);
@@ -160,20 +157,19 @@ describe("cross-instruction state attacks", () => {
   describe("timing boundaries", () => {
     it("buy_call at trading_deadline - 1 succeeds, at trading_deadline fails", async () => {
       const cohort = await startCohort(t);
+      const atm = await currentAtmStrike(t);
       const cohortData = await t.program.account.cohort.fetch(cohort);
       const deadline = cohortData.tradingDeadline.toNumber();
 
-      // Warp to deadline - 1
       await warpToTimestamp(t.context, deadline - 1);
-      const pos = await buyCall(t, cohort, { strikeBps: 12_000, nonce: 0 });
+      const pos = await buyCall(t, cohort, { strikeBps: atm, nonce: 0 });
       expect(pos).to.not.be.null;
 
-      // Warp to deadline exactly
       await warpToTimestamp(t.context, deadline);
-      const [posPda2] = findPositionPda(t.program.programId, cohort, t.buyer.publicKey, 12_000, 1);
+      const [posPda2] = findPositionPda(t.program.programId, cohort, t.buyer.publicKey, atm, 1);
       await expectError(
         () => t.program.methods
-          .buyCall(12_000, SOL(0.05), 1)
+          .buyCall(atm, SOL(0.05), 1)
           .accounts({
             buyer: t.buyer.publicKey,
             globalState: t.globalState,
@@ -195,35 +191,33 @@ describe("cross-instruction state attacks", () => {
       const cohort = await startCohort(t);
       const pos = await buyCall(t, cohort);
       await warpPastObservation(t.context);
-      await submitMhi(t, cohort);
+      await submitMhi(t, cohort, await currentAtmStrike(t));
 
       const cohortData = await t.program.account.cohort.fetch(cohort);
       const deadline = cohortData.settlementDeadline.toNumber();
       await warpToTimestamp(t.context, deadline);
 
-      // Non-keeper should succeed at or after deadline
       await settleBatch(t, cohort, [pos], t.randomUser);
       await claimPosition(t, cohort, pos, t.buyer);
     });
 
     it("claim at claim_deadline fails (< not <=)", async () => {
       const cohort = await startCohort(t);
-      const pos = await buyCall(t, cohort, { strikeBps: 12_000 });
+      const live = await currentLiveStrikes(t);
+      const pos = await buyCall(t, cohort, { strikeBps: live[2] });
       await warpPastObservation(t.context);
-      await submitMhi(t, cohort, 15_000);
+      await submitMhi(t, cohort, live[5]!);
       await settleBatch(t, cohort, [pos]);
 
       const posData = await t.program.account.position.fetch(pos);
       const claimDeadline = posData.claimDeadline.toNumber();
 
-      // At exactly claim_deadline → claim fails (program checks clock < deadline)
       await warpToTimestamp(t.context, claimDeadline);
       await expectError(
         () => claimPosition(t, cohort, pos, t.buyer),
         "ClaimExpired",
       );
 
-      // Expire needs clock > deadline (grace period), so warp 1 more second
       await warpTime(t.context, 1);
       await t.program.methods
         .expirePosition()
@@ -243,18 +237,21 @@ describe("cross-instruction state attacks", () => {
   describe("position PDA integrity", () => {
     it("same user, same strike, same nonce in different cohorts → distinct PDAs", async () => {
       const cohort1 = await startCohort(t);
-      const pos1 = await buyCall(t, cohort1, { strikeBps: 12_000, nonce: 0 });
+      const atm1 = await currentAtmStrike(t);
+      const pos1 = await buyCall(t, cohort1, { strikeBps: atm1, nonce: 0 });
       await warpPastObservation(t.context);
-      await submitMhi(t, cohort1);
+      await submitMhi(t, cohort1, atm1);
       await settleBatch(t, cohort1, [pos1]);
       await claimPosition(t, cohort1, pos1, t.buyer);
 
       const cohort2 = await startCohort(t);
-      const pos2 = await buyCall(t, cohort2, { strikeBps: 12_000, nonce: 0 });
+      const atm2 = await currentAtmStrike(t);
+      const pos2 = await buyCall(t, cohort2, { strikeBps: atm2, nonce: 0 });
 
+      // Cohort PDAs differ even if buyer/strike/nonce match (cohort key is in the seed).
       expect(pos1.toBase58()).to.not.equal(pos2.toBase58());
       await warpPastObservation(t.context);
-      await submitMhi(t, cohort2);
+      await submitMhi(t, cohort2, atm2);
       await settleBatch(t, cohort2, [pos2]);
       await claimPosition(t, cohort2, pos2, t.buyer);
     });
@@ -263,7 +260,7 @@ describe("cross-instruction state attacks", () => {
       const cohort = await startCohort(t);
       const pos = await buyCall(t, cohort);
       await warpPastObservation(t.context);
-      await submitMhi(t, cohort);
+      await submitMhi(t, cohort, await currentAtmStrike(t));
       await settleBatch(t, cohort, [pos]);
       await claimPosition(t, cohort, pos, t.buyer);
 
@@ -274,7 +271,7 @@ describe("cross-instruction state attacks", () => {
       const cohort = await startCohort(t);
       const pos = await buyCall(t, cohort);
       await warpPastObservation(t.context);
-      await submitMhi(t, cohort);
+      await submitMhi(t, cohort, await currentAtmStrike(t));
       await settleBatch(t, cohort, [pos]);
       await warpTime(t.context, FAST_CLAIM_EXPIRY + 1);
 

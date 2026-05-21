@@ -17,12 +17,9 @@ import * as anchor from "@coral-xyz/anchor";
 import { SystemProgram } from "@solana/web3.js";
 import {
   setupProtocol, TestCtx, expectError,
-  startCohort, buyCall, warpPastObservation, submitMhi, settleBatch,
-  claimPosition, warpTime, assertVaultConservation,
-  voidCohort, SOL, getBalance, fundedKeypair,
-  findPositionPda,
-  FAST_TRADING_WINDOW, FAST_MEASUREMENT, FAST_OBSERVATION,
-  FAST_SETTLEMENT_DEADLINE, MHI_CAP_BPS,
+  startCohort, buyCall, assertVaultConservation,
+  voidCohort, SOL, fundedKeypair, claimPosition,
+  findPositionPda, currentLiveStrikes,
 } from "./_setup";
 
 describe("vault risk cap enforcement", () => {
@@ -41,19 +38,15 @@ describe("vault risk cap enforcement", () => {
 
     it("buy exceeding per-cohort risk cap → InsufficientVaultCollateral", async () => {
       const cohort = await startCohort(t);
-
-      // Vault total = available + active_collateral ≈ 10 SOL (= 10_000_000_000 lamports)
-      // Risk cap = 15% → max_cohort_collateral ≈ 1.5 SOL
-      // At strike 10_000 (1.0x), collateral = size * (30000-10000)/10000 = size * 2.0
-      // To exceed 1.5 SOL cap: need collateral > 1.5 SOL → size > 0.75 SOL
-      // Try buying 2 SOL at 1.0x strike → collateral = 4 SOL > 1.5 SOL cap
+      const live = await currentLiveStrikes(t);
+      const lowest = live[0]!; // largest collateral exposure per unit
       const [posPda] = findPositionPda(
-        t.program.programId, cohort, t.buyer.publicKey, 10_000, 0,
+        t.program.programId, cohort, t.buyer.publicKey, lowest, 0,
       );
 
       await expectError(
         () => t.program.methods
-          .buyCall(10_000, SOL(2), 0)
+          .buyCall(lowest, SOL(2), 0)
           .accounts({
             buyer: t.buyer.publicKey,
             globalState: t.globalState,
@@ -73,11 +66,10 @@ describe("vault risk cap enforcement", () => {
 
     it("buy within per-cohort risk cap succeeds", async () => {
       const cohort = await startCohort(t);
-
-      // At 1.0x strike, size = 0.5 SOL → collateral = 0.75 SOL
-      // 0.75 SOL < 1.5 SOL cap → should succeed
+      const live = await currentLiveStrikes(t);
+      // A small size at the lowest strike comfortably under the cap.
       const pos = await buyCall(t, cohort, {
-        strikeBps: 10_000,
+        strikeBps: live[0],
         size: SOL(0.5),
         nonce: 0,
       });
@@ -100,31 +92,28 @@ describe("vault risk cap enforcement", () => {
 
     it("multiple positions that cumulatively exceed cap → last one rejected", async () => {
       const cohort = await startCohort(t);
+      const live = await currentLiveStrikes(t);
+      const highest = live[6]!; // smallest collateral per unit (above ATM)
 
-      // At strike 20_000 (2.0x), collateral = size * (30000-20000)/10000 = size * 1.0
-      // Risk cap ≈ 1.5 SOL
-      // Buy 0.5 SOL → collateral = 0.5 SOL (within cap)
       const pos1 = await buyCall(t, cohort, {
-        strikeBps: 20_000,
+        strikeBps: highest,
         size: SOL(0.5),
         nonce: 0,
       });
 
-      // Buy another 0.5 SOL → cumulative collateral = 1.0 SOL (still within 1.5 cap)
       const pos2 = await buyCall(t, cohort, {
-        strikeBps: 20_000,
+        strikeBps: highest,
         size: SOL(0.5),
         nonce: 1,
       });
 
-      // Buy another 0.7 SOL → cumulative collateral = 1.7 SOL > 1.5 cap
       const [posPda3] = findPositionPda(
-        t.program.programId, cohort, t.buyer.publicKey, 20_000, 2,
+        t.program.programId, cohort, t.buyer.publicKey, highest, 2,
       );
 
       await expectError(
         () => t.program.methods
-          .buyCall(20_000, SOL(0.7), 2)
+          .buyCall(highest, SOL(0.7), 2)
           .accounts({
             buyer: t.buyer.publicKey,
             globalState: t.globalState,
@@ -182,10 +171,11 @@ describe("vault risk cap enforcement", () => {
 
     it("large position succeeds when risk cap is disabled", async () => {
       const cohort = await startCohort(t);
+      const live = await currentLiveStrikes(t);
 
-      // 2 SOL at 1.0x strike → 3 SOL collateral (would fail with 15% cap on 10 SOL vault)
+      // SOL(2) at the lowest strike would breach the 15% cap on a 10 SOL vault.
       const pos = await buyCall(t, cohort, {
-        strikeBps: 10_000,
+        strikeBps: live[0],
         size: SOL(2),
         nonce: 0,
       });
@@ -208,35 +198,33 @@ describe("vault risk cap enforcement", () => {
 
     it("multiple sybil buyers cannot exceed per-cohort risk cap", async () => {
       const cohort = await startCohort(t);
+      const live = await currentLiveStrikes(t);
+      const highest = live[6]!;
 
-      // Create sybil addresses
       const sybil1 = await fundedKeypair(t.context);
       const sybil2 = await fundedKeypair(t.context);
 
-      // Each buys 0.5 SOL at 2.0x → 0.5 SOL collateral each ((3.0-2.0)*0.5)
       const pos1 = await buyCall(t, cohort, {
         buyer: sybil1,
-        strikeBps: 20_000,
+        strikeBps: highest,
         size: SOL(0.5),
         nonce: 0,
       });
       const pos2 = await buyCall(t, cohort, {
         buyer: sybil2,
-        strikeBps: 20_000,
+        strikeBps: highest,
         size: SOL(0.5),
         nonce: 0,
       });
 
-      // Cumulative collateral = 1.0 SOL (within 1.5 cap).
-      // Another sybil buys 0.7 SOL → cumulative = 1.7 SOL > 1.5 cap → should fail
       const sybil3 = await fundedKeypair(t.context);
       const [posPda3] = findPositionPda(
-        t.program.programId, cohort, sybil3.publicKey, 20_000, 0,
+        t.program.programId, cohort, sybil3.publicKey, highest, 0,
       );
 
       await expectError(
         () => t.program.methods
-          .buyCall(20_000, SOL(0.7), 0)
+          .buyCall(highest, SOL(0.7), 0)
           .accounts({
             buyer: sybil3.publicKey,
             globalState: t.globalState,
@@ -291,11 +279,12 @@ describe("vault risk cap enforcement", () => {
 
     it("single buyer can take multiple positions (no per-address limit in V1)", async () => {
       const cohort = await startCohort(t);
+      const live = await currentLiveStrikes(t);
 
-      // Buy at multiple strikes with same buyer - all should succeed
-      const pos1 = await buyCall(t, cohort, { strikeBps: 10_000, nonce: 0, size: SOL(0.5) });
-      const pos2 = await buyCall(t, cohort, { strikeBps: 12_000, nonce: 0, size: SOL(0.5) });
-      const pos3 = await buyCall(t, cohort, { strikeBps: 15_000, nonce: 0, size: SOL(0.5) });
+      // Buy at three different strikes with same buyer - all should succeed.
+      const pos1 = await buyCall(t, cohort, { strikeBps: live[0], nonce: 0, size: SOL(0.5) });
+      const pos2 = await buyCall(t, cohort, { strikeBps: live[3], nonce: 0, size: SOL(0.5) });
+      const pos3 = await buyCall(t, cohort, { strikeBps: live[5], nonce: 0, size: SOL(0.5) });
 
       // Verify all created with same owner
       for (const pos of [pos1, pos2, pos3]) {

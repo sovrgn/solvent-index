@@ -1,15 +1,16 @@
 use anchor_lang::prelude::*;
 use anchor_lang::system_program;
 
-use crate::constants::{BASE_MARKUP_BPS, COHORT_SEED, EMA_STATE_SEED, GLOBAL_STATE_SEED, POSITION_SEED, VAULT_SEED};
+use crate::constants::{
+    COHORT_SEED, EMA_BASE_MARKUP_BPS, EMA_STATE_SEED, GLOBAL_STATE_SEED, MIN_PREMIUM_BPS_FLOOR,
+    POSITION_SEED, VAULT_SEED,
+};
 use crate::errors::MhiError;
 use crate::events::CallPurchased;
-use crate::math::ema::cold_start_markup;
+use crate::math::ema::{cold_start_markup, fair_payoff_bps};
 use crate::math::payoff::total_collateral_lamports_ceil;
-use crate::math::bps::mul_bps_u16;
 use crate::math::premium::{
-    bonding_surge_bps, charged_premium_bps, premium_lamports,
-    referral_split, volume_fee_lamports,
+    charged_premium_bps, premium_lamports, referral_split, volume_fee_lamports,
 };
 use crate::state::{Cohort, EmaState, GlobalState, Position, Vault};
 
@@ -83,51 +84,51 @@ pub fn handler<'info>(
     require!(size_lamports > 0, MhiError::PositionSizeZero);
     require!(size_lamports >= gs.min_position_lamports, MhiError::PositionTooSmall);
 
-    // Strike must be valid
+    // Strike must be one of the slots set when the cohort started.
+    let cohort_ref = &ctx.accounts.cohort;
+    let strike_idx = cohort_ref
+        .strikes
+        .iter()
+        .position(|&s| s == strike_bps)
+        .ok_or(MhiError::InvalidStrike)?;
+
+    // Fair payoff: max(fast_frac, slow_frac) * current_anchor / BPS_DENOM.
+    // Uses the CURRENT global anchor (not the cohort snapshot) so quotes
+    // track anchor moves caused by later cohorts settling during this one's
+    // trading window.
     let ema = &ctx.accounts.ema_state;
-    let strike_idx = ema.find_strike(strike_bps).ok_or(MhiError::InvalidStrike)?;
-
-
-    let strike_ema = &ema.strikes[strike_idx];
-    let fair_bps = strike_ema.fair_premium_bps();
-
-    // Layer 1: Base option-premium markup with cold-start amplification
-    let cold_base_markup = cold_start_markup(BASE_MARKUP_BPS, gs.total_cohorts)
+    let slot = &ema.slots[strike_idx];
+    let fair_bps = fair_payoff_bps(slot.fast_frac_bps, slot.slow_frac_bps, gs.strike_anchor_bps)
         .ok_or(MhiError::Overflow)?;
 
-    // Layer 2: Per-strike demand markup (adjusted between cohorts)
-    let demand_markup = strike_ema.demand_markup_bps;
-
-    // Layer 3: Intra-cohort bonding surge (sqrt curve, first buyer = 0)
-    let vault_total = ctx.accounts.vault.available_lamports
-        .checked_add(ctx.accounts.vault.active_collateral_lamports)
+    // Layer 1: Base option-premium markup with cold-start amplification.
+    let cold_base_markup = cold_start_markup(EMA_BASE_MARKUP_BPS, gs.total_cohorts)
         .ok_or(MhiError::Overflow)?;
-    let cohort_capacity = if gs.max_vault_risk_per_cohort_bps > 0 {
-        mul_bps_u16(vault_total, gs.max_vault_risk_per_cohort_bps)
-            .ok_or(MhiError::Overflow)?
-    } else {
-        vault_total
-    };
-    let current_strike_vol = ctx.accounts.cohort.strike_volume_lamports[strike_idx];
-    let left_vol = if strike_idx > 0 {
-        ctx.accounts.cohort.strike_volume_lamports[strike_idx - 1]
-    } else { 0 };
-    let right_vol = if strike_idx + 1 < ctx.accounts.cohort.strike_volume_lamports.len() {
-        ctx.accounts.cohort.strike_volume_lamports[strike_idx + 1]
-    } else { 0 };
-    let surge = bonding_surge_bps(current_strike_vol, size_lamports, cohort_capacity, left_vol, right_vol);
 
-    // Combined markup: all three layers additive
-    let total_markup = (cold_base_markup as u32)
+    // Layer 2: Per-slot demand markup (adjusted between cohorts).
+    let demand_markup = slot.demand_markup_bps;
+
+    let total_markup_u32 = (cold_base_markup as u32)
         .checked_add(demand_markup as u32)
-        .ok_or(MhiError::Overflow)?
-        .checked_add(surge as u32)
         .ok_or(MhiError::Overflow)?;
-    let total_markup_u16 = u16::try_from(total_markup)
-        .map_err(|_| MhiError::Overflow)?;
+    let total_markup_u16 = u16::try_from(total_markup_u32).map_err(|_| MhiError::Overflow)?;
 
-    let charged_bps = charged_premium_bps(fair_bps, total_markup_u16)
+    // Use the cohort's at-start cap snapshot, not the current global cap.
+    // An authority `update_config { mhi_cap_bps }` mid-trading must not
+    // retroactively change collateral / premium ceilings for this cohort.
+    let mhi_cap_bps = ctx.accounts.cohort.mhi_cap_bps_at_start;
+
+    let charged_bps_raw = charged_premium_bps(fair_bps, total_markup_u16)
         .ok_or(MhiError::Overflow)?;
+    // Cap charged BPS at the maximum payoff per unit (collateral cap, using
+    // the cohort snapshot) and floor at MIN_PREMIUM_BPS_FLOOR. Mirrors
+    // keeper's clamp in priceCallEMA — guarantees a non-zero charge even
+    // when the EMA is cold.
+    let max_payoff_bps = mhi_cap_bps.saturating_sub(strike_bps);
+    let mut charged_bps = charged_bps_raw.min(max_payoff_bps);
+    if charged_bps < MIN_PREMIUM_BPS_FLOOR {
+        charged_bps = MIN_PREMIUM_BPS_FLOOR.min(max_payoff_bps);
+    }
 
     // Premium in lamports (rounds UP)
     let premium = premium_lamports(charged_bps, size_lamports)
@@ -138,7 +139,6 @@ pub fn handler<'info>(
     require!(premium >= gs.min_premium_lamports.max(1), MhiError::PremiumBelowFloor);
 
 
-    let mhi_cap_bps = gs.mhi_cap_bps;
     let premium_fee_bps = gs.premium_fee_bps;
     let referral_share_bps = gs.referral_share_bps;
 

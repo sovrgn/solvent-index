@@ -1,8 +1,8 @@
 import { expect } from "chai";
 import {
   setupProtocol, expectError, warpTime, warpPastObservation,
-  startCohort, buyCall, submitMhi, settleBatch, claimPosition,
-  runFullCohort, voidCohort, TestCtx, MHI_CAP_BPS,
+  startCohort, submitMhi, settleBatch,
+  runFullCohort, voidCohort, TestCtx, MHI_CAP_BPS, DEFAULT_STRIKES_BPS,
   FAST_TRADING_WINDOW, FAST_MEASUREMENT,
 } from "./_setup";
 
@@ -14,7 +14,7 @@ describe("08 - submit_mhi", () => {
 
   describe("happy path", () => {
     it("keeper submits MHI after observation - cohort.mhiBps set", async () => {
-      const { cohort } = await runFullCohort(t, 14_000, [{ strikeBps: 12_000 }]);
+      const { cohort } = await runFullCohort(t, 14_000, [{}]);
       const cohortData = await t.program.account.cohort.fetch(cohort);
       expect(cohortData.mhiBps).to.equal(14_000);
     });
@@ -35,7 +35,7 @@ describe("08 - submit_mhi", () => {
   describe("clamp behavior", () => {
     it("value within 33% passes through approximately", async () => {
       // lastMhiBps = 14_000 from happy path. 15_000 is ~7% above → within 33%.
-      const { cohort } = await runFullCohort(t, 15_000, [{ strikeBps: 12_000 }]);
+      const { cohort } = await runFullCohort(t, 15_000, [{}]);
       const cohortData = await t.program.account.cohort.fetch(cohort);
       expect(cohortData.mhiBps).to.be.closeTo(15_000, 100);
     });
@@ -44,7 +44,7 @@ describe("08 - submit_mhi", () => {
       const gs = await t.program.account.globalState.fetch(t.globalState);
       const lastMhi = gs.lastMhiBps;
 
-      const { cohort } = await runFullCohort(t, 30_000, [{ strikeBps: 10_000 }]);
+      const { cohort } = await runFullCohort(t, 30_000, [{}]);
       const cohortData = await t.program.account.cohort.fetch(cohort);
       const maxUp = Math.floor(lastMhi * 3300 / 10000);
       expect(cohortData.mhiBps).to.equal(lastMhi + maxUp);

@@ -14,15 +14,31 @@ pub const BPS_DENOMINATOR: u32 = 10_000;
 /// Maximum number of strikes supported
 pub const NUM_STRIKES: usize = 7;
 
-/// Default strike ladder (in BPS): 1.0x, 1.1x, 1.2x, 1.3x, 1.5x, 1.8x, 2.0x
-pub const DEFAULT_STRIKES_BPS: [u32; NUM_STRIKES] = [10_000, 11_000, 12_000, 13_000, 15_000, 18_000, 20_000];
-
 /// Default MHI cap: 3.0x = 30_000 BPS
 pub const MHI_CAP_BPS_DEFAULT: u32 = 30_000;
 
 /// Base option-premium markup applied on top of the fair premium.
 /// Cold-start-amplified during the first COLD_START_COHORTS, then steady at this value.
-pub const BASE_MARKUP_BPS: u16 = 2_000;
+/// Mirrors keeper's `emaBaseMarkupBps` default in ema-pricer-config.ts.
+pub const EMA_BASE_MARKUP_BPS: u16 = 2_000;
+
+/// Floor for the BPS-rate charged in buy_call. When the EMA is cold or every
+/// markup layer is zero, charge at least this much of position size. Mirrors
+/// keeper's `minPremiumBps` default (0.5%) in ema-pricer-config.ts.
+pub const MIN_PREMIUM_BPS_FLOOR: u32 = 50;
+
+/// Strike anchor multipliers (in BPS). Per-cohort strikes = floor(anchor * multiplier[i] / 10_000).
+/// Mirrors `STRIKE_MULTIPLIERS` in keeper/lib/constants.ts. Must stay sorted ascending.
+pub const STRIKE_MULTIPLIERS_BPS: [u32; NUM_STRIKES] = [9_000, 9_500, 10_000, 10_500, 11_000, 12_000, 13_000];
+
+/// Strike anchor EMA alpha (in BPS). 0.3 = 3_000 / 10_000. Fast adaptation (~2 round half-life).
+pub const STRIKE_ANCHOR_ALPHA_BPS: u32 = 3_000;
+/// Strike anchor EMA complement: 1 - alpha = 7_000 / 10_000.
+pub const STRIKE_ANCHOR_COMPLEMENT_BPS: u32 = 7_000;
+/// Cold-start anchor when no settlements have happened yet. 1.25x.
+pub const STRIKE_ANCHOR_DEFAULT_BPS: u32 = 12_500;
+/// Floor below which derived strikes would degenerate. 0.2x.
+pub const STRIKE_ANCHOR_MIN_BPS: u32 = 2_000;
 
 /// EMA alpha values (in BPS of BPS_DENOMINATOR)
 /// fast_alpha = 0.15 = 1_500 / 10_000
@@ -70,8 +86,6 @@ pub const STRIKE_DEMAND_STEP_BPS: u16 = 100;     // 1% adjustment per cohort
 pub const STRIKE_SHARE_HIGH_BPS: u16 = 5_000;    // >50% of volume = high demand
 pub const STRIKE_SHARE_LOW_BPS: u16 = 1_000;     // <10% of volume = low demand
 
-/// Intra-cohort bonding curve (Option B: within trading window)
-pub const BONDING_MAX_SURGE_BPS: u16 = 2_000;    // 20% max surge at full utilization
 pub const DEFAULT_MAX_POSITION_PER_ADDRESS_BPS: u16 = 2_000; // 20%
 pub const DEFAULT_MAX_VAULT_RISK_PER_COHORT_BPS: u16 = 1_500; // 15%
 pub const DEFAULT_MAX_POSITION_COLLATERAL_BPS: u16 = 500; // 5% of cohort cap (0.75% of vault)
@@ -86,4 +100,4 @@ pub const MIN_COHORT_TOKENS: u16 = 10;
 pub const MHI_ABSOLUTE_FLOOR_BPS: u32 = 1_000;
 
 /// Account version for future migrations
-pub const ACCOUNT_VERSION: u8 = 1;
+pub const ACCOUNT_VERSION: u8 = 2;

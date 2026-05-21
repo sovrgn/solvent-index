@@ -54,7 +54,8 @@ pub fn handler<'info>(
     }
 
     let mhi_bps = cohort.mhi_bps;
-    let cap_bps = gs.mhi_cap_bps;
+    // cap_bps from cohort snapshot, not live global state — see N-01 fix.
+    let cap_bps = cohort.mhi_cap_bps_at_start;
     let cohort_key = cohort.key();
 
     let mut settled_count = 0u32;

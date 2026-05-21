@@ -67,9 +67,14 @@ async function setupP2pProtocol(seedSol = 5, poolDeposit = 5): Promise<{
 }
 
 async function fillVaultAndBuyP2p(
-  t: TestCtx, pool: PublicKey, buyer: Keypair, strike = 12_000, size = SOL(0.05),
+  t: TestCtx, pool: PublicKey, buyer: Keypair, strikeArg?: number, size = SOL(0.05),
 ): Promise<{ cohort: PublicKey; vaultPositions: PublicKey[]; p2pPosition: PublicKey }> {
   const cohort = await startCohort(t);
+  let strike = strikeArg;
+  if (strike === undefined) {
+    const c = await t.program.account.cohort.fetch(cohort);
+    strike = ((c as any).strikes as number[])[2]!;
+  }
   const vaultPositions: PublicKey[] = [];
   for (let i = 0; i < 50; i++) {
     try {
@@ -114,7 +119,12 @@ async function settleAndCloseCohort(
     try { await claimPosition(t, cohort, pos, t.buyer); } catch { /* expired or already claimed */ }
   }
   await t.program.methods.closeCohort()
-    .accounts({ caller: t.keeper.publicKey, globalState: t.globalState, cohort } as any)
+    .accounts({
+      caller: t.keeper.publicKey,
+      globalState: t.globalState,
+      authority: t.authority.publicKey,
+      cohort,
+    } as any)
     .signers([t.keeper]).rpc();
 }
 
@@ -301,19 +311,18 @@ describe("26 - withdraw_p2p dust threshold + auto-close", () => {
       );
     });
 
-    it("withdraw during active cohort -> rejected (Idle required)", async () => {
+    it("withdraw during active cohort succeeds when pool has free capital", async () => {
+      // withdraw_p2p does NOT gate on cohort status (see withdraw_p2p.rs) —
+      // only on pool.available_lamports. Writers can pull free capital any
+      // time; locked collateral and unclaimed payouts are unwithdrawable.
       const { t, pool, writer, writerAccount } = await setupP2pProtocol(5, 5);
 
-      // Start a cohort (protocol status changes from Idle)
       const cohort = await startCohort(t);
 
       const wa = await (t.program.account as any).writerAccount.fetch(writerAccount);
-      await expectError(
-        () => (t.program.methods as any).withdrawP2P(new anchor.BN(wa.shares.toNumber()))
-          .accounts({ writer: writer.publicKey, globalState: t.globalState, p2PPool: pool, writerAccount, systemProgram: SystemProgram.programId } as any)
-          .signers([writer]).rpc(),
-        "InvalidCohortStatus"
-      );
+      await (t.program.methods as any).withdrawP2P(new anchor.BN(wa.shares.toNumber()))
+        .accounts({ writer: writer.publicKey, globalState: t.globalState, p2PPool: pool, writerAccount, systemProgram: SystemProgram.programId } as any)
+        .signers([writer]).rpc();
 
       // Cleanup: settle the cohort
       await warpTime(t.context, FULL_WARP);
@@ -352,13 +361,29 @@ describe("26 - withdraw_p2p dust threshold + auto-close", () => {
         expect(buyerBalAfter).to.be.greaterThan(buyerBalBefore - 10_000);
       }
 
-      // Now close cohort so pool returns to Idle
+      // Settle epoch is done; expire any unclaimed vault positions so the
+      // cohort is quiescent enough for close_cohort to succeed.
       await warpTime(t.context, FAST_CLAIM_EXPIRY + 1);
       for (const pos of vaultPositions) {
-        try { await claimPosition(t, cohort, pos, t.buyer); } catch { /* expired */ }
+        try { await claimPosition(t, cohort, pos, t.buyer); } catch {
+          try {
+            await t.program.methods.expirePosition()
+              .accounts({
+                caller: t.randomUser.publicKey,
+                vault: t.vault, cohort, position: pos,
+                systemProgram: SystemProgram.programId,
+              } as any)
+              .signers([t.randomUser]).rpc();
+          } catch { /* already gone */ }
+        }
       }
       await t.program.methods.closeCohort()
-        .accounts({ caller: t.keeper.publicKey, globalState: t.globalState, cohort } as any)
+        .accounts({
+          caller: t.keeper.publicKey,
+          globalState: t.globalState,
+          authority: t.authority.publicKey,
+          cohort,
+        } as any)
         .signers([t.keeper]).rpc();
 
       // Writer withdraws all available shares - pool still has the buyer's claimed payout deducted

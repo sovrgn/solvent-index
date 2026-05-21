@@ -2,14 +2,14 @@ use anchor_lang::prelude::*;
 use anchor_lang::system_program;
 
 use crate::constants::{
-    BASE_MARKUP_BPS, COHORT_SEED, EMA_STATE_SEED, GLOBAL_STATE_SEED, P2P_POOL_SEED,
-    P2P_POSITION_SEED, VAULT_SEED,
+    COHORT_SEED, EMA_BASE_MARKUP_BPS, EMA_STATE_SEED, GLOBAL_STATE_SEED, MIN_PREMIUM_BPS_FLOOR,
+    P2P_POOL_SEED, P2P_POSITION_SEED, VAULT_SEED,
 };
 use crate::errors::MhiError;
 use crate::math::bps::mul_bps_u16;
-use crate::math::ema::cold_start_markup;
+use crate::math::ema::{cold_start_markup, fair_payoff_bps};
 use crate::math::payoff::total_collateral_lamports_ceil;
-use crate::math::premium::{bonding_surge_bps, charged_premium_bps, premium_lamports};
+use crate::math::premium::{charged_premium_bps, premium_lamports};
 use crate::state::{Cohort, EmaState, GlobalState, P2pPool, P2pPosition, Vault};
 
 #[derive(Accounts)]
@@ -94,11 +94,21 @@ pub fn handler(
     require!(size_lamports > 0, MhiError::PositionSizeZero);
     require!(size_lamports >= gs.min_position_lamports, MhiError::PositionTooSmall);
 
-    let ema = &ctx.accounts.ema_state;
-    let strike_idx = ema.find_strike(strike_bps).ok_or(MhiError::InvalidStrike)?;
+    let strike_idx = ctx
+        .accounts
+        .cohort
+        .strikes
+        .iter()
+        .position(|&s| s == strike_bps)
+        .ok_or(MhiError::InvalidStrike)?;
+
+    // Use the cohort's at-start cap snapshot, not the current global cap.
+    // An authority `update_config { mhi_cap_bps }` mid-trading must not
+    // retroactively change collateral / premium ceilings for this cohort.
+    let mhi_cap_bps = ctx.accounts.cohort.mhi_cap_bps_at_start;
 
     let collateral = total_collateral_lamports_ceil(
-        gs.mhi_cap_bps, strike_bps, size_lamports,
+        mhi_cap_bps, strike_bps, size_lamports,
     ).ok_or(MhiError::Overflow)?;
 
     {
@@ -121,39 +131,27 @@ pub fn handler(
         MhiError::InsufficientWriterCollateral
     );
 
-    let strike_ema = &ema.strikes[strike_idx];
-    let fair_bps = strike_ema.fair_premium_bps();
-
-    let cold_base_markup = cold_start_markup(BASE_MARKUP_BPS, gs.total_cohorts)
+    let ema = &ctx.accounts.ema_state;
+    let slot = &ema.slots[strike_idx];
+    let fair_bps = fair_payoff_bps(slot.fast_frac_bps, slot.slow_frac_bps, gs.strike_anchor_bps)
         .ok_or(MhiError::Overflow)?;
-    let demand_markup = strike_ema.demand_markup_bps;
 
-    // Bonding surge uses shared strike volume
-    let vault_total = ctx.accounts.vault.available_lamports
-        .checked_add(ctx.accounts.vault.active_collateral_lamports)
+    let cold_base_markup = cold_start_markup(EMA_BASE_MARKUP_BPS, gs.total_cohorts)
         .ok_or(MhiError::Overflow)?;
-    let total_capacity = vault_total
-        .checked_add(ctx.accounts.p2p_pool.available_lamports)
-        .ok_or(MhiError::Overflow)?;
-    let current_strike_vol = ctx.accounts.cohort.strike_volume_lamports[strike_idx];
-    let left_vol = if strike_idx > 0 {
-        ctx.accounts.cohort.strike_volume_lamports[strike_idx - 1]
-    } else { 0 };
-    let right_vol = if strike_idx + 1 < ctx.accounts.cohort.strike_volume_lamports.len() {
-        ctx.accounts.cohort.strike_volume_lamports[strike_idx + 1]
-    } else { 0 };
-    let surge = bonding_surge_bps(current_strike_vol, size_lamports, total_capacity, left_vol, right_vol);
+    let demand_markup = slot.demand_markup_bps;
 
-    let total_markup = (cold_base_markup as u32)
+    let total_markup_u32 = (cold_base_markup as u32)
         .checked_add(demand_markup as u32)
-        .ok_or(MhiError::Overflow)?
-        .checked_add(surge as u32)
         .ok_or(MhiError::Overflow)?;
-    let total_markup_u16 = u16::try_from(total_markup)
-        .map_err(|_| MhiError::Overflow)?;
+    let total_markup_u16 = u16::try_from(total_markup_u32).map_err(|_| MhiError::Overflow)?;
 
-    let charged_bps = charged_premium_bps(fair_bps, total_markup_u16)
+    let charged_bps_raw = charged_premium_bps(fair_bps, total_markup_u16)
         .ok_or(MhiError::Overflow)?;
+    let max_payoff_bps = mhi_cap_bps.saturating_sub(strike_bps);
+    let mut charged_bps = charged_bps_raw.min(max_payoff_bps);
+    if charged_bps < MIN_PREMIUM_BPS_FLOOR {
+        charged_bps = MIN_PREMIUM_BPS_FLOOR.min(max_payoff_bps);
+    }
     let premium = premium_lamports(charged_bps, size_lamports)
         .ok_or(MhiError::Overflow)?;
     // Reject positions below minimum premium floor.

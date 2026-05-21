@@ -39,10 +39,12 @@ pub struct VoidCohort<'info> {
 pub fn handler(ctx: Context<VoidCohort>) -> Result<()> {
     let clock = Clock::get()?;
 
-    // Read values before mutable borrows
+    // Read values before mutable borrows.
+    // cap_bps from cohort snapshot, not live global state — authority cannot
+    // retroactively change the cap that sized this cohort's collateral.
     let cohort_key = ctx.accounts.cohort.key();
     let cohort_index = ctx.accounts.cohort.index;
-    let cap_bps = ctx.accounts.global_state.mhi_cap_bps;
+    let cap_bps = ctx.accounts.cohort.mhi_cap_bps_at_start;
 
     //
     // First call: status must not be resolved, no MHI, no settlements, past recovery.

@@ -73,13 +73,13 @@ describe("event emissions", () => {
       const idx = gs.currentCohortIndex.toNumber();
       const [cohortPda] = findCohortPda(t.program.programId, idx);
 
+      const { deriveStrikes, STRIKE_ANCHOR_DEFAULT_BPS } = await import("./_setup");
       const tx = await t.program.methods
-        .startCohort()
+        .startCohort(deriveStrikes(STRIKE_ANCHOR_DEFAULT_BPS))
         .accounts({
           keeper: t.keeper.publicKey,
           globalState: t.globalState,
           vault: t.vault,
-          emaState: t.emaState,
           cohort: cohortPda,
           systemProgram: SystemProgram.programId,
         } as any)

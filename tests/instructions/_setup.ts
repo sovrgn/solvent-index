@@ -48,8 +48,25 @@ export const FAST_SETTLEMENT_DEADLINE = 5;
 export const FAST_CLAIM_EXPIRY = 5;
 
 export const NUM_STRIKES = 7;
-export const DEFAULT_STRIKES_BPS = [10_000, 11_000, 12_000, 13_000, 15_000, 18_000, 20_000];
 export const MHI_CAP_BPS = 30_000;
+export const BPS_DENOMINATOR = 10_000;
+
+/** Must mirror mhi-program/src/constants.rs STRIKE_MULTIPLIERS_BPS exactly. */
+export const STRIKE_MULTIPLIERS_BPS = [9_000, 9_500, 10_000, 10_500, 11_000, 12_000, 13_000];
+/** Must mirror STRIKE_ANCHOR_MIN_BPS in constants.rs. */
+export const STRIKE_ANCHOR_MIN_BPS = 2_000;
+/** Must mirror STRIKE_ANCHOR_DEFAULT_BPS in constants.rs. */
+export const STRIKE_ANCHOR_DEFAULT_BPS = 12_500;
+
+/** Off-chain mirror of `crate::math::ema::derive_strikes`. */
+export function deriveStrikes(anchorBps: number): number[] {
+  return STRIKE_MULTIPLIERS_BPS.map(mult =>
+    Math.max(STRIKE_ANCHOR_MIN_BPS, Math.floor((anchorBps * mult) / BPS_DENOMINATOR)),
+  );
+}
+
+/** Strikes the chain produces from the cold-start anchor. */
+export const DEFAULT_STRIKES_BPS = deriveStrikes(STRIKE_ANCHOR_DEFAULT_BPS);
 
 export const SOL = (n: number) => new anchor.BN(n * LAMPORTS_PER_SOL);
 
@@ -106,7 +123,6 @@ export async function setupProtocol(opts?: {
         observationSeconds: FAST_OBSERVATION,
         settlementDeadlineSeconds: FAST_SETTLEMENT_DEADLINE,
         claimExpirySeconds: FAST_CLAIM_EXPIRY,
-        initialEmaValues: [3260, 2330, 1560, 1000, 450, 80, 30],
       } as any)
       .accounts({
         authority: authority.publicKey,
@@ -209,18 +225,36 @@ export async function accountExists(
 }
 
 
-/** Start a cohort. Returns the cohort PDA. */
-export async function startCohort(t: TestCtx): Promise<PublicKey> {
+/** Read the current chain strike anchor and derive the live strike ladder
+ *  for the upcoming cohort. Use this when a test needs to know what strikes
+ *  the next start_cohort will accept (the cold-start DEFAULT_STRIKES_BPS
+ *  literal goes stale as soon as the anchor moves). */
+export async function currentLiveStrikes(t: TestCtx): Promise<number[]> {
+  const gs = await t.program.account.globalState.fetch(t.globalState);
+  return deriveStrikes((gs as any).strikeAnchorBps as number);
+}
+
+/** Convenience: current ATM (slot index 2) strike. */
+export async function currentAtmStrike(t: TestCtx): Promise<number> {
+  return (await currentLiveStrikes(t))[2]!;
+}
+
+/** Start a cohort with strikes derived from the chain's current anchor. */
+export async function startCohort(
+  t: TestCtx,
+  opts: { strikes?: number[] } = {},
+): Promise<PublicKey> {
   const gs = await t.program.account.globalState.fetch(t.globalState);
   const idx = gs.currentCohortIndex.toNumber();
   const [cohortPda] = findCohortPda(t.program.programId, idx);
+  const anchorBps = (gs as any).strikeAnchorBps as number;
+  const strikes = opts.strikes ?? deriveStrikes(anchorBps);
   await t.program.methods
-    .startCohort()
+    .startCohort(strikes)
     .accounts({
       keeper: t.keeper.publicKey,
       globalState: t.globalState,
       vault: t.vault,
-      emaState: t.emaState,
       cohort: cohortPda,
       systemProgram: SystemProgram.programId,
     } as any)
@@ -242,7 +276,14 @@ export async function buyCall(
   } = {},
 ): Promise<PublicKey> {
   const who = opts.buyer ?? t.buyer;
-  const strike = opts.strikeBps ?? 12_000;
+  // Strikes drift each cohort as the anchor evolves. Default the buy to the
+  // ATM slot of THIS cohort (read on-chain) — the hardcoded cold-start
+  // `DEFAULT_STRIKES_BPS` constant goes stale after the first settlement.
+  let strike = opts.strikeBps;
+  if (strike === undefined) {
+    const c = await t.program.account.cohort.fetch(cohort);
+    strike = ((c as any).strikes as number[])[2]!;
+  }
   const size = opts.size ?? SOL(0.05);
   const nonce = opts.nonce ?? 0;
   const [posPda] = findPositionPda(t.program.programId, cohort, who.publicKey, strike, nonce);

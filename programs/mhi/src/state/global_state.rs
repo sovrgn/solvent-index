@@ -62,6 +62,17 @@ pub struct GlobalState {
     pub p2p_writer_fee_bps: u16,
     /// Kill switch for P2P functionality
     pub p2p_enabled: bool,
+
+    /// EMA-smoothed strike anchor (BPS). Updated in submit_mhi using the
+    /// clamped MHI: anchor = (ALPHA*mhi + COMPLEMENT*prev_anchor) / 10_000,
+    /// floored at STRIKE_ANCHOR_MIN_BPS. Used by start_cohort to verify
+    /// keeper-supplied strikes, and by buy_call to rescale the fractional EMA
+    /// into a payoff bps quote.
+    pub strike_anchor_bps: u32,
+    /// Number of settlements that have updated `strike_anchor_bps`. Stays at 0
+    /// until the first submit_mhi lands, at which point the cold-start default
+    /// is replaced with the first observed MHI.
+    pub strike_anchor_settlement_count: u64,
 }
 
 impl GlobalState {
@@ -96,7 +107,9 @@ impl GlobalState {
         + 1   // paused
         + 2   // p2p_buyer_fee_bps
         + 2   // p2p_writer_fee_bps
-        + 1;  // p2p_enabled
+        + 1   // p2p_enabled
+        + 4   // strike_anchor_bps
+        + 8;  // strike_anchor_settlement_count
 
     /// Whether a new cohort can be started (below the overlap limit).
     pub fn can_start_cohort(&self) -> bool {

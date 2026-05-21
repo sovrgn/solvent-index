@@ -7,12 +7,11 @@
 //!
 
 use crate::constants::{
-    BPS_DENOMINATOR, BONDING_MAX_SURGE_BPS, MARKUP_MAX_BPS, MARKUP_MIN_BPS,
-    MARKUP_STEP_BPS, NUM_STRIKES,
+    BPS_DENOMINATOR, MARKUP_MAX_BPS, MARKUP_MIN_BPS, MARKUP_STEP_BPS,
     STRIKE_DEMAND_MAX_BPS, STRIKE_DEMAND_MIN_BPS, STRIKE_DEMAND_STEP_BPS,
     STRIKE_SHARE_HIGH_BPS, STRIKE_SHARE_LOW_BPS, UTILIZATION_HIGH_BPS, UTILIZATION_LOW_BPS,
 };
-use crate::math::bps::{clamp_u16, isqrt, mul_bps_ceil, mul_bps_u16};
+use crate::math::bps::{clamp_u16, mul_bps_ceil, mul_bps_u16};
 
 /// Charged premium in BPS: `fair * (1 + markup)`.
 /// `= fair * (BPS_DENOM + markup) / BPS_DENOM`.
@@ -115,51 +114,6 @@ pub fn adjust_strike_demand_markup(current_bps: u16, share_bps: u16) -> u16 {
         current_bps
     };
     clamp_u16(adjusted, STRIKE_DEMAND_MIN_BPS, STRIKE_DEMAND_MAX_BPS)
-}
-
-/// Intra-cohort bonding curve surge (sqrt curve, midpoint pricing) with
-/// cross-strike spillover.
-///
-/// Uses the midpoint of [existing_vol, existing_vol + position_size] to
-/// compute the surge. This means a whale taking large capacity pays the
-/// average surge across their entire position, not just the entry price.
-///
-/// Adjacent strike volumes spill over at 50%, preventing traders from
-/// routing to neighboring low-volume strikes to avoid surge pricing.
-///
-/// `effective_vol = strike_vol + left_neighbor_vol/2 + right_neighbor_vol/2`
-/// `surge = max_surge * sqrt((effective_vol + size/2) * NUM_STRIKES / cohort_capacity)`
-///
-/// A small first buyer (size << capacity) pays near-zero surge.
-/// A whale taking 50% of capacity as first buyer pays surge at the 25% mark.
-pub fn bonding_surge_bps(
-    strike_vol: u64,
-    position_size: u64,
-    cohort_capacity: u64,
-    left_neighbor_vol: u64,
-    right_neighbor_vol: u64,
-) -> u16 {
-    if cohort_capacity == 0 || BONDING_MAX_SURGE_BPS == 0 {
-        return 0;
-    }
-    // Cross-strike spillover: adjacent strikes contribute 50% of their volume
-    let effective_vol = strike_vol
-        .saturating_add(left_neighbor_vol / 2)
-        .saturating_add(right_neighbor_vol / 2);
-    // Midpoint: effective_vol + size/2
-    let midpoint = effective_vol.saturating_add(position_size / 2);
-    // normalized = midpoint * NUM_STRIKES * BPS_DENOMINATOR / cohort_capacity
-    let scaled = (midpoint as u128)
-        .saturating_mul(NUM_STRIKES as u128)
-        .saturating_mul(BPS_DENOMINATOR as u128)
-        / (cohort_capacity as u128);
-    // Cap at BPS_DENOMINATOR (100%) before sqrt
-    let capped = scaled.min(BPS_DENOMINATOR as u128) as u64;
-    // sqrt(capped) where capped is in [0, 10000]
-    // sqrt(10000) = 100, so surge = max_surge * sqrt(capped) / 100
-    let root = isqrt(capped);
-    let surge = (BONDING_MAX_SURGE_BPS as u64) * root / 100;
-    surge.min(BONDING_MAX_SURGE_BPS as u64) as u16
 }
 
 #[cfg(test)]

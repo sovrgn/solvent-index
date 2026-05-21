@@ -53,6 +53,12 @@ pub enum MhiError {
     #[msg("Strike is not a valid strike from the EMA state")]
     InvalidStrike,
 
+    #[msg("Strikes do not match the anchor-derived ladder")]
+    StrikesDoNotMatchAnchor,
+
+    #[msg("Strikes must be monotonically increasing")]
+    StrikesNotMonotonic,
+
     #[msg("MHI value must be greater than zero")]
     MhiZero,
 

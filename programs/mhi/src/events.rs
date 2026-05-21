@@ -29,6 +29,11 @@ pub struct CohortStarted {
     pub index: u64,
     pub trading_start: i64,
     pub trading_deadline: i64,
+    /// Per-slot strikes for this cohort (BPS). Indexed 0..NUM_STRIKES.
+    pub strikes: [u32; crate::constants::NUM_STRIKES],
+    /// Snapshot of the global strike anchor at start (used as the EMA-fraction
+    /// denominator at settlement).
+    pub strike_anchor_bps: u32,
 }
 
 #[event]
@@ -45,9 +50,13 @@ pub struct CallPurchased {
 #[event]
 pub struct MhiSubmitted {
     pub cohort_index: u64,
+    /// The (clamped) MHI actually stored on chain — keeper consumers must
+    /// feed THIS, not their pre-submission value, into the local anchor / EMA.
     pub mhi_bps: u32,
     pub token_count: u16,
     pub cohort_hash: [u8; 32],
+    /// Updated `GlobalState.strike_anchor_bps` after this settlement.
+    pub new_strike_anchor_bps: u32,
 }
 
 #[event]

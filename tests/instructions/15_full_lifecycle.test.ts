@@ -1,13 +1,12 @@
 import { expect } from "chai";
-import * as anchor from "@coral-xyz/anchor";
 import { SystemProgram } from "@solana/web3.js";
 import {
   setupProtocol, TestCtx,
   startCohort, buyCall, warpPastObservation, submitMhi, settleBatch,
   claimPosition, warpTime, assertVaultConservation,
   voidCohort, runFullCohort, SOL, getBalance,
-  FAST_SETTLEMENT_DEADLINE, FAST_CLAIM_EXPIRY,
-  DEFAULT_STRIKES_BPS,
+  currentLiveStrikes, currentAtmStrike,
+  FAST_CLAIM_EXPIRY,
 } from "./_setup";
 
 describe("full lifecycle", () => {
@@ -24,11 +23,12 @@ describe("full lifecycle", () => {
       const cohort = await startCohort(t);
       await assertVaultConservation(t);
 
-      const pos = await buyCall(t, cohort, { strikeBps: 12_000, size: SOL(0.5) });
+      const live = await currentLiveStrikes(t);
+      const pos = await buyCall(t, cohort, { strikeBps: live[2], size: SOL(0.5) });
       await assertVaultConservation(t);
 
       await warpPastObservation(t.context);
-      await submitMhi(t, cohort, 15_000);
+      await submitMhi(t, cohort, live[5]!); // ITM
       await assertVaultConservation(t);
 
       await settleBatch(t, cohort, [pos]);
@@ -57,10 +57,9 @@ describe("full lifecycle", () => {
         const gs = await t.program.account.globalState.fetch(t.globalState);
         expect(gs.currentCohortIndex.toNumber()).to.equal(i);
 
-        await runFullCohort(t, 12_000 + i * 1000, [
-          { strikeBps: 10_000, nonce: 0 },
-          { strikeBps: 12_000, nonce: 0, buyer: t.buyer2 },
-        ]);
+        // Default strike (ATM of the just-started cohort) — anchor moves
+        // each round so we can't pre-pick a hardcoded literal.
+        await runFullCohort(t, undefined, [{ nonce: 0 }, { nonce: 0, buyer: t.buyer2 }]);
         await assertVaultConservation(t);
       }
 
@@ -77,27 +76,21 @@ describe("full lifecycle", () => {
 
     it("init → seed → start → buy → void → claim refund", async () => {
       const cohort = await startCohort(t);
-      const pos = await buyCall(t, cohort, { strikeBps: 12_000, size: SOL(0.2) });
-
-      const posData = await t.program.account.position.fetch(pos);
-      const vaultPremium = posData.vaultPremiumLamports.toNumber();
+      const pos = await buyCall(t, cohort, { size: SOL(0.2) });
 
       const vaultBefore = await t.program.account.vault.fetch(t.vault);
       const collateral = vaultBefore.activeCollateralLamports.toNumber();
       expect(collateral).to.be.greaterThan(0);
 
-      // Keeper "dies" - void after recovery deadline
       await voidCohort(t, cohort, [pos]);
 
       const vaultAfterVoid = await t.program.account.vault.fetch(t.vault);
       expect(vaultAfterVoid.activeCollateralLamports.toNumber()).to.equal(0);
 
-      // Buyer claims refund
       const balBefore = await getBalance(t.context.banksClient, t.buyer.publicKey);
       await claimPosition(t, cohort, pos, t.buyer);
       const balAfter = await getBalance(t.context.banksClient, t.buyer.publicKey);
 
-      // Refund should be approximately vault_premium (minus tx fee)
       expect(balAfter - balBefore).to.be.greaterThan(0);
       await assertVaultConservation(t);
     });
@@ -111,11 +104,14 @@ describe("full lifecycle", () => {
 
     it("correct payouts for each position", async () => {
       const cohort = await startCohort(t);
-      const posITM = await buyCall(t, cohort, { strikeBps: 10_000, size: SOL(0.1), nonce: 0 });
-      const posOTM = await buyCall(t, cohort, { strikeBps: 20_000, size: SOL(0.1), nonce: 1 });
+      const live = await currentLiveStrikes(t);
+      const posITM = await buyCall(t, cohort, { strikeBps: live[0], size: SOL(0.1), nonce: 0 });
+      const posOTM = await buyCall(t, cohort, { strikeBps: live[6], size: SOL(0.1), nonce: 1 });
 
       await warpPastObservation(t.context);
-      await submitMhi(t, cohort, 15_000); // 10000 ITM, 20000 OTM
+      // MHI between live[0] and live[6] → posITM in the money, posOTM out.
+      const mhi = Math.floor((live[0]! + live[6]!) / 2);
+      await submitMhi(t, cohort, mhi);
       await settleBatch(t, cohort, [posITM, posOTM]);
 
       const itmData = await t.program.account.position.fetch(posITM);
@@ -138,24 +134,28 @@ describe("full lifecycle", () => {
 
     it("positions at all strikes settle correctly", async () => {
       const cohort = await startCohort(t);
+      const live = await currentLiveStrikes(t);
       const positions = [];
-      for (let i = 0; i < DEFAULT_STRIKES_BPS.length; i++) {
+      for (let i = 0; i < live.length; i++) {
         const pos = await buyCall(t, cohort, {
-          strikeBps: DEFAULT_STRIKES_BPS[i],
+          strikeBps: live[i],
           size: SOL(0.02),
           nonce: i,
         });
         positions.push(pos);
       }
 
+      // Submit MHI between live[3] and live[4] so strikes 0-3 are ITM and
+      // strikes 4-6 are OTM.
+      const mhi = Math.floor((live[3]! + live[4]!) / 2);
       await warpPastObservation(t.context);
-      await submitMhi(t, cohort, 14_000); // 10k,11k,12k ITM; 15k,20k OTM
+      await submitMhi(t, cohort, mhi);
       await settleBatch(t, cohort, positions);
 
       for (let i = 0; i < positions.length; i++) {
         const data = await t.program.account.position.fetch(positions[i]);
         expect(data.settled).to.equal(true);
-        if (DEFAULT_STRIKES_BPS[i] < 14_000) {
+        if (live[i]! < mhi) {
           expect(data.payoutLamports.toNumber()).to.be.greaterThan(0);
         } else {
           expect(data.payoutLamports.toNumber()).to.equal(0);
@@ -175,9 +175,10 @@ describe("full lifecycle", () => {
 
     it("settle → wait → expire → vault.available increases by payout", async () => {
       const cohort = await startCohort(t);
-      const pos = await buyCall(t, cohort, { strikeBps: 12_000 });
+      const live = await currentLiveStrikes(t);
+      const pos = await buyCall(t, cohort, { strikeBps: live[2] });
       await warpPastObservation(t.context);
-      await submitMhi(t, cohort, 15_000);
+      await submitMhi(t, cohort, live[5]!);
       await settleBatch(t, cohort, [pos]);
 
       const posData = await t.program.account.position.fetch(pos);
@@ -216,26 +217,26 @@ describe("full lifecycle", () => {
 
     before(async () => { t = await setupProtocol({ seedSol: 10 }); });
 
-    it("max positions at 1.0x strike, MHI at cap - vault can pay all", async () => {
+    it("max positions at lowest strike, MHI at cap - vault can pay all", async () => {
       const cohort = await startCohort(t);
-
-      // Buy 2 positions at 1.0x strike (maximum payout exposure)
-      const pos1 = await buyCall(t, cohort, { strikeBps: 10_000, size: SOL(0.1), nonce: 0 });
-      const pos2 = await buyCall(t, cohort, { strikeBps: 10_000, size: SOL(0.1), nonce: 1, buyer: t.buyer2 });
+      const live = await currentLiveStrikes(t);
+      // Lowest strike = maximum payout exposure.
+      const lowest = live[0]!;
+      const pos1 = await buyCall(t, cohort, { strikeBps: lowest, size: SOL(0.1), nonce: 0 });
+      const pos2 = await buyCall(t, cohort, { strikeBps: lowest, size: SOL(0.1), nonce: 1, buyer: t.buyer2 });
 
       await warpPastObservation(t.context);
-      await submitMhi(t, cohort, 30_000); // MHI at cap - maximum payout
+      await submitMhi(t, cohort, 30_000); // MHI at cap — maximum payout
 
       await settleBatch(t, cohort, [pos1, pos2]);
 
-      // Both positions should have maximum payout
+      // payoff = (cap - lowest) / 10_000 * size, rounds DOWN.
+      const expectedPayout = Math.floor(((30_000 - lowest) * 100_000_000) / 10_000);
       const d1 = await t.program.account.position.fetch(pos1);
       const d2 = await t.program.account.position.fetch(pos2);
-      // payoff = (30000 - 10000) / 10000 * size = 2.0 * size
-      expect(d1.payoutLamports.toNumber()).to.equal(200_000_000);
-      expect(d2.payoutLamports.toNumber()).to.equal(200_000_000);
+      expect(d1.payoutLamports.toNumber()).to.equal(expectedPayout);
+      expect(d2.payoutLamports.toNumber()).to.equal(expectedPayout);
 
-      // Vault must be able to pay both
       await claimPosition(t, cohort, pos1, t.buyer);
       await claimPosition(t, cohort, pos2, t.buyer2);
       await assertVaultConservation(t);
@@ -243,7 +244,6 @@ describe("full lifecycle", () => {
       const vault = await t.program.account.vault.fetch(t.vault);
       expect(vault.activeCollateralLamports.toNumber()).to.equal(0);
       expect(vault.unclaimedPayoutsLamports.toNumber()).to.equal(0);
-      // Vault should still have positive balance (seed + premiums - payouts)
       expect(vault.availableLamports.toNumber()).to.be.greaterThan(0);
     });
   });
@@ -256,18 +256,19 @@ describe("full lifecycle", () => {
 
     it("14 positions across all strikes, settled in batches", async () => {
       const cohort = await startCohort(t);
+      const live = await currentLiveStrikes(t);
       const positions = [];
 
-      // 2 positions per strike across 7 strikes = 14 positions
-      for (let s = 0; s < DEFAULT_STRIKES_BPS.length; s++) {
+      // 2 positions per strike across all 7 strikes = 14 positions
+      for (let s = 0; s < live.length; s++) {
         positions.push(await buyCall(t, cohort, {
-          strikeBps: DEFAULT_STRIKES_BPS[s],
+          strikeBps: live[s],
           size: SOL(0.02),
           nonce: s,
           buyer: t.buyer,
         }));
         positions.push(await buyCall(t, cohort, {
-          strikeBps: DEFAULT_STRIKES_BPS[s],
+          strikeBps: live[s],
           size: SOL(0.02),
           nonce: s,
           buyer: t.buyer2,
@@ -277,12 +278,10 @@ describe("full lifecycle", () => {
       expect(positions.length).to.equal(14);
 
       await warpPastObservation(t.context);
-      await submitMhi(t, cohort, 14_000);
+      const mhi = Math.floor((live[3]! + live[4]!) / 2);
+      await submitMhi(t, cohort, mhi);
 
-      // Settle in 3 batches (5, 5, 4)
       await settleBatch(t, cohort, positions.slice(0, 5));
-      const gs1 = await t.program.account.globalState.fetch(t.globalState);
-      // Not all settled yet - index should NOT have advanced
       const cohortData1 = await t.program.account.cohort.fetch(cohort);
       expect(cohortData1.positionsSettled).to.equal(5);
 
@@ -294,13 +293,11 @@ describe("full lifecycle", () => {
       const cohortData3 = await t.program.account.cohort.fetch(cohort);
       expect(cohortData3.positionsSettled).to.equal(14);
 
-      // All settled - index advanced
+      // currentCohortIndex is monotonic — it advanced at start_cohort, not at
+      // settle. active_cohorts is the terminal-state signal now.
       const gs2 = await t.program.account.globalState.fetch(t.globalState);
-      expect(gs2.currentCohortIndex.toNumber()).to.equal(
-        gs1.currentCohortIndex.toNumber() + 1,
-      );
+      expect(gs2.activeCohorts).to.equal(0);
 
-      // Claim all
       for (let i = 0; i < positions.length; i++) {
         const buyer = i % 2 === 0 ? t.buyer : t.buyer2;
         await claimPosition(t, cohort, positions[i], buyer);
@@ -317,25 +314,25 @@ describe("full lifecycle", () => {
     before(async () => { t = await setupProtocol(); });
 
     it("extreme MHI is clamped, gradual rise allowed", async () => {
-      // Cohort 1: establish baseline at 12000
-      await runFullCohort(t, 12_000, [{ strikeBps: 10_000 }]);
+      // Cohort 1: first submission is unclamped, sets the baseline.
+      await runFullCohort(t, 12_000, [{}]);
 
       let gs = await t.program.account.globalState.fetch(t.globalState);
       expect(gs.lastMhiBps).to.equal(12_000);
 
-      // Cohort 2: try to jump to 30000 - should be clamped to ~15960 (12000 + 33%)
+      // Cohort 2: try to jump to 30000 — clamped to last + 33%.
       const cohort2 = await startCohort(t);
       await warpPastObservation(t.context);
       await submitMhi(t, cohort2, 30_000);
 
       const c2 = await t.program.account.cohort.fetch(cohort2);
       const maxUp = Math.floor(12_000 * 3300 / 10000);
-      expect(c2.mhiBps).to.equal(12_000 + maxUp); // clamped to upper bound
+      expect(c2.mhiBps).to.equal(12_000 + maxUp);
       expect(c2.mhiBps).to.be.lessThan(30_000);
 
       await settleBatch(t, cohort2, []);
 
-      // Cohort 3: try extreme low (1) - should be clamped
+      // Cohort 3: try extreme low (1) — clamped to last - 33%.
       gs = await t.program.account.globalState.fetch(t.globalState);
       const lastMhi = gs.lastMhiBps;
       const cohort3 = await startCohort(t);

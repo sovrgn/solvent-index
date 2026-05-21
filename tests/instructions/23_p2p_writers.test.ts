@@ -5,11 +5,10 @@ import {
   setupProtocol, TestCtx, expectError,
   startCohort, buyCall, warpPastObservation, warpTime, submitMhi, settleBatch,
   claimPosition, assertVaultConservation, fundedKeypair,
-  findCohortPda, findP2pPositionPda, findPositionPda,
-  SOL, getBalance,
-  FAST_TRADING_WINDOW, FAST_MEASUREMENT, FAST_OBSERVATION,
-  FAST_SETTLEMENT_DEADLINE, FAST_CLAIM_EXPIRY,
-  MHI_CAP_BPS, DEFAULT_STRIKES_BPS,
+  findP2pPositionPda,
+  SOL,
+  currentAtmStrike,
+  FAST_CLAIM_EXPIRY, FAST_SETTLEMENT_DEADLINE,
 } from "./_setup";
 
 describe("23 - P2P writers", () => {
@@ -44,11 +43,12 @@ describe("23 - P2P writers", () => {
         .accounts({ authority: t.authority.publicKey, globalState: t.globalState, p2PPool: poolPda, systemProgram: SystemProgram.programId } as any).rpc();
 
       const cohort = await startCohort(t);
+      const atm = await currentAtmStrike(t);
       const buyer = await fundedKeypair(t.context, 10);
-      const [p2pPos] = findP2pPositionPda(t.program.programId, cohort, buyer.publicKey, 12_000, 0);
+      const [p2pPos] = findP2pPositionPda(t.program.programId, cohort, buyer.publicKey, atm, 0);
 
       await expectError(
-        () => (t.program.methods as any).buyCallP2P(12_000, SOL(0.05), 0)
+        () => (t.program.methods as any).buyCallP2P(atm, SOL(0.05), 0)
           .accounts({
             buyer: buyer.publicKey, globalState: t.globalState, vault: t.vault,
             p2PPool: poolPda, cohort, emaState: t.emaState,
@@ -109,7 +109,6 @@ describe("23 - P2P writers", () => {
       const cohort = await startCohort(t);
 
       const pos = await buyCall(t, cohort, {
-        strikeBps: 12_000,
         size: SOL(0.05),
         nonce: 0,
       });
@@ -168,12 +167,13 @@ describe("23 - P2P writers", () => {
         .signers([writer]).rpc();
 
       const cohort = await startCohort(t);
+      const atm = await currentAtmStrike(t);
       const buyer = await fundedKeypair(t.context, 10);
-      const [p2pPos] = findP2pPositionPda(t.program.programId, cohort, buyer.publicKey, 12_000, 0);
+      const [p2pPos] = findP2pPositionPda(t.program.programId, cohort, buyer.publicKey, atm, 0);
 
       // Vault has 20 SOL, 15% cap = 3 SOL - plenty for a 0.05 SOL position
       await expectError(
-        () => (t.program.methods as any).buyCallP2P(12_000, SOL(0.05), 0)
+        () => (t.program.methods as any).buyCallP2P(atm, SOL(0.05), 0)
           .accounts({
             buyer: buyer.publicKey, globalState: t.globalState, vault: t.vault,
             p2PPool: poolPda, cohort, emaState: t.emaState,
@@ -259,8 +259,8 @@ describe("23 - P2P writers", () => {
     });
 
     it("pool deposit → vault overflow → P2P buy → settle → claim → withdraw", async () => {
-      const strike = 12_000;
       const cohort = await startCohort(t);
+      const strike = await currentAtmStrike(t);
 
       // 1. Fill the vault
       let vaultPositions: PublicKey[] = [];
@@ -342,10 +342,27 @@ describe("23 - P2P writers", () => {
           .rpc();
       }
 
-      // 7. Claim vault positions + warp
+      // 7. Claim or expire all vault positions so the cohort can close.
+      //    Claim first; for any that miss the window, fall through to expire.
       await warpTime(t.context, FAST_CLAIM_EXPIRY + 1);
       for (const pos of vaultPositions) {
-        try { await claimPosition(t, cohort, pos, t.buyer); } catch { /* expired */ }
+        try {
+          await claimPosition(t, cohort, pos, t.buyer);
+        } catch {
+          // Past claim_deadline — fall through to expire so the PDA closes
+          // and outstanding_positions drops to 0 (close_cohort needs is_quiescent()).
+          await t.program.methods
+            .expirePosition()
+            .accounts({
+              caller: t.randomUser.publicKey,
+              vault: t.vault,
+              cohort,
+              position: pos,
+              systemProgram: SystemProgram.programId,
+            } as any)
+            .signers([t.randomUser])
+            .rpc();
+        }
       }
 
       // 8. Writer withdraws from pool (between cohorts)
@@ -356,12 +373,13 @@ describe("23 - P2P writers", () => {
       // Warp past settlement deadline + claim expiry for close_cohort
       await warpTime(t.context, FAST_SETTLEMENT_DEADLINE + FAST_CLAIM_EXPIRY + 2);
 
-      // Close cohort
+      // Close cohort (rent refund flows to authority).
       await t.program.methods
         .closeCohort()
         .accounts({
           caller: t.keeper.publicKey,
           globalState: t.globalState,
+          authority: t.authority.publicKey,
           cohort,
         } as any)
         .signers([t.keeper])

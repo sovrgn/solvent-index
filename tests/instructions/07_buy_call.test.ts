@@ -42,7 +42,7 @@ describe("07 - buy_call", () => {
     });
 
     it("buy at valid strike - Position PDA created with correct fields", async () => {
-      const strikeBps = 12_000;
+      const strikeBps = DEFAULT_STRIKES_BPS[2];
       const size = SOL(0.05);
       const nonce = 0;
 
@@ -65,7 +65,7 @@ describe("07 - buy_call", () => {
 
     it("premium non-zero, collateral locked, vault accounting correct", async () => {
       // Position from previous test - fetch it
-      const strikeBps = 12_000;
+      const strikeBps = DEFAULT_STRIKES_BPS[2];
       const [posPda] = findPositionPda(
         t.program.programId,
         cohort,
@@ -116,7 +116,7 @@ describe("07 - buy_call", () => {
         t.program.programId,
         cohort,
         t.buyer.publicKey,
-        12_000,
+        DEFAULT_STRIKES_BPS[2],
         0,
       );
       await voidCohort(t, cohort, [pos]);
@@ -129,7 +129,7 @@ describe("07 - buy_call", () => {
       );
 
       const posPda = await buyCall(t, cohort, {
-        strikeBps: 12_000,
+        strikeBps: DEFAULT_STRIKES_BPS[2],
         size: SOL(0.05),
         nonce: 0,
         referrer: referrer.publicKey,
@@ -196,14 +196,14 @@ describe("07 - buy_call", () => {
         t.program.programId,
         cohort,
         t.buyer.publicKey,
-        12_000,
+        DEFAULT_STRIKES_BPS[2],
         0,
       );
 
       await expectError(
         () =>
           t.program.methods
-            .buyCall(12_000, SOL(0.05), 0)
+            .buyCall(DEFAULT_STRIKES_BPS[2], SOL(0.05), 0)
             .accounts({
               buyer: t.buyer.publicKey,
               globalState: t.globalState,
@@ -260,14 +260,14 @@ describe("07 - buy_call", () => {
         t.program.programId,
         cohort,
         t.buyer.publicKey,
-        12_000,
+        DEFAULT_STRIKES_BPS[2],
         0,
       );
 
       await expectError(
         () =>
           t.program.methods
-            .buyCall(12_000, SOL(0.05), 0)
+            .buyCall(DEFAULT_STRIKES_BPS[2], SOL(0.05), 0)
             .accounts({
               buyer: t.buyer.publicKey,
               globalState: t.globalState,
@@ -292,14 +292,14 @@ describe("07 - buy_call", () => {
         t.program.programId,
         cohort,
         t.buyer.publicKey,
-        12_000,
+        DEFAULT_STRIKES_BPS[2],
         0,
       );
 
       await expectError(
         () =>
           t.program.methods
-            .buyCall(12_000, new anchor.BN(0), 0)
+            .buyCall(DEFAULT_STRIKES_BPS[2], new anchor.BN(0), 0)
             .accounts({
               buyer: t.buyer.publicKey,
               globalState: t.globalState,
@@ -325,14 +325,14 @@ describe("07 - buy_call", () => {
         t.program.programId,
         cohort,
         t.buyer.publicKey,
-        12_000,
+        DEFAULT_STRIKES_BPS[2],
         0,
       );
 
       await expectError(
         () =>
           t.program.methods
-            .buyCall(12_000, new anchor.BN(1), 0)
+            .buyCall(DEFAULT_STRIKES_BPS[2], new anchor.BN(1), 0)
             .accounts({
               buyer: t.buyer.publicKey,
               globalState: t.globalState,
@@ -386,23 +386,22 @@ describe("07 - buy_call", () => {
     it("vault insufficient collateral → InsufficientVaultCollateral", async () => {
       const cohort = await startCohort(t);
 
-      // At strike 10000, collateral = size * (30000-10000)/10000 = size * 2.0
-      // Vault has ~20 SOL available. To exhaust it, need size > 20/2.0 = 10 SOL
-      // Use a massive size that definitely exceeds vault capacity
+      // SOL(100) at any valid strike exhausts the ~20-SOL test vault.
+      const lowestStrike = DEFAULT_STRIKES_BPS[0];
       const excessiveSize = SOL(100);
 
       const [posPda] = findPositionPda(
         t.program.programId,
         cohort,
         t.buyer.publicKey,
-        10_000,
+        lowestStrike,
         0,
       );
 
       await expectError(
         () =>
           t.program.methods
-            .buyCall(10_000, excessiveSize, 0)
+            .buyCall(lowestStrike, excessiveSize, 0)
             .accounts({
               buyer: t.buyer.publicKey,
               globalState: t.globalState,
@@ -429,7 +428,7 @@ describe("07 - buy_call", () => {
       // min_position_lamports = 10_000_000 = 0.01 SOL
       const minSize = new anchor.BN(10_000_000);
       const posPda = await buyCall(t, cohort, {
-        strikeBps: 12_000,
+        strikeBps: DEFAULT_STRIKES_BPS[2],
         size: minSize,
         nonce: 0,
       });
@@ -469,7 +468,7 @@ describe("07 - buy_call", () => {
 
       for (let nonce = 0; nonce < 3; nonce++) {
         const posPda = await buyCall(t, cohort, {
-          strikeBps: 12_000,
+          strikeBps: DEFAULT_STRIKES_BPS[2],
           size: SOL(0.02),
           nonce,
         });
@@ -484,7 +483,7 @@ describe("07 - buy_call", () => {
       for (let nonce = 0; nonce < 3; nonce++) {
         const pos = await t.program.account.position.fetch(positions[nonce]);
         expect(pos.nonce).to.equal(nonce);
-        expect(pos.strikeBps).to.equal(12_000);
+        expect(pos.strikeBps).to.equal(DEFAULT_STRIKES_BPS[2]);
       }
 
       await voidCohort(t, cohort, positions);
@@ -493,7 +492,8 @@ describe("07 - buy_call", () => {
     it("multiple positions same buyer, different strikes", async () => {
       const cohort = await startCohort(t);
       const positions: anchor.web3.PublicKey[] = [];
-      const strikes = [10_000, 15_000, 20_000];
+      // Sample low / ATM / high from the anchor-derived ladder.
+      const strikes = [DEFAULT_STRIKES_BPS[0], DEFAULT_STRIKES_BPS[2], DEFAULT_STRIKES_BPS[6]];
 
       for (const strikeBps of strikes) {
         const posPda = await buyCall(t, cohort, {

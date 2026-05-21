@@ -77,6 +77,24 @@ pub struct Cohort {
     /// Count of P2pPosition PDAs still alive. Same lifecycle as outstanding_positions
     /// but for the P2P side.
     pub outstanding_p2p_positions: u32,
+
+    /// Per-slot strikes for this cohort (BPS), set by start_cohort. Computed
+    /// off-chain by the keeper from `floor(anchor * STRIKE_MULTIPLIERS_BPS[i] / 10_000)`
+    /// (with the STRIKE_ANCHOR_MIN_BPS floor) and verified on-chain against
+    /// the same formula evaluated on `GlobalState.strike_anchor_bps` at start.
+    /// Indexed by slot 0..NUM_STRIKES, ascending.
+    pub strikes: [u32; NUM_STRIKES],
+    /// Snapshot of `GlobalState.strike_anchor_bps` at start_cohort. Used as
+    /// the denominator when submit_mhi normalizes payoff into a fraction —
+    /// must travel with the cohort because later cohorts may shift the global
+    /// anchor before this one settles.
+    pub strike_anchor_bps_at_start: u32,
+    /// Snapshot of `GlobalState.mhi_cap_bps` at start_cohort. The cap that
+    /// sizes locked collateral (buy_call), caps released collateral and
+    /// payouts (settle, void), and bounds the keeper's MHI submission. Must
+    /// travel with the cohort so an authority `update_config { mhi_cap_bps }`
+    /// mid-flight cannot retroactively change any cohort's economics.
+    pub mhi_cap_bps_at_start: u32,
 }
 
 impl Cohort {
@@ -107,7 +125,10 @@ impl Cohort {
         + (8 * NUM_STRIKES) // p2p_strike_collateral
         + 4   // positions_voided
         + 4   // outstanding_positions
-        + 4;  // outstanding_p2p_positions
+        + 4   // outstanding_p2p_positions
+        + (4 * NUM_STRIKES) // strikes
+        + 4   // strike_anchor_bps_at_start
+        + 4;  // mhi_cap_bps_at_start
 
     pub fn is_trading(&self) -> bool {
         self.status == CohortStatus::Trading

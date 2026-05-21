@@ -45,14 +45,19 @@ describe("initialize", () => {
       expect(gs.claimExpirySeconds).to.equal(FAST_CLAIM_EXPIRY);
     });
 
-    it("GlobalState status is Idle, cohort_index 0, paused false", async () => {
+    it("GlobalState: cohort_index 0, active_cohorts 0, paused false", async () => {
       const gs = await t.program.account.globalState.fetch(t.globalState);
-
-      expect(JSON.stringify(gs.currentCohortStatus)).to.equal(
-        JSON.stringify({ idle: {} }),
-      );
+      // ProtocolStatus enum was replaced by active_cohorts counter; idle
+      // is now expressed as active_cohorts == 0.
       expect(gs.currentCohortIndex.toNumber()).to.equal(0);
+      expect(gs.activeCohorts).to.equal(0);
       expect(gs.paused).to.equal(false);
+    });
+
+    it("Strike anchor seeded at the cold-start default with zero settlements", async () => {
+      const gs = await t.program.account.globalState.fetch(t.globalState);
+      expect((gs as any).strikeAnchorBps).to.equal(12_500);
+      expect(((gs as any).strikeAnchorSettlementCount as anchor.BN).toString()).to.equal("0");
     });
 
     it("pending_authority is Pubkey::default()", async () => {
@@ -78,14 +83,17 @@ describe("initialize", () => {
       // a separate skipInit context below.
     });
 
-    it("EMA strikes initialized with provided initial_ema_values", async () => {
-      const ema = await t.program.account.emaState.fetch(t.emaState);
-      const expectedEma = [3260, 2330, 1560, 1000, 450, 80, 30];
-
+    it("EMA slots initialized empty; strikes live on Cohort, not EmaState", async () => {
+      // EmaState no longer holds strikes. Strikes are per-cohort, derived
+      // from the global anchor at start_cohort. Initial EMA fractions are 0;
+      // cold-start markup carries the launch period.
+      const ema: any = await t.program.account.emaState.fetch(t.emaState);
+      expect(ema.slots).to.have.length(NUM_STRIKES);
       for (let i = 0; i < NUM_STRIKES; i++) {
-        expect(ema.strikes[i].strikeBps).to.equal(DEFAULT_STRIKES_BPS[i]);
-        expect(ema.strikes[i].fastEmaBps).to.equal(expectedEma[i]);
-        expect(ema.strikes[i].slowEmaBps).to.equal(expectedEma[i]);
+        expect(ema.slots[i].fastFracBps).to.equal(0);
+        expect(ema.slots[i].slowFracBps).to.equal(0);
+        // demand markup seeded at STRIKE_DEMAND_DEFAULT_BPS = 500
+        expect(ema.slots[i].demandMarkupBps).to.equal(500);
       }
     });
   });
@@ -108,7 +116,6 @@ describe("initialize", () => {
           observationSeconds: FAST_OBSERVATION,
           settlementDeadlineSeconds: FAST_SETTLEMENT_DEADLINE,
           claimExpirySeconds: FAST_CLAIM_EXPIRY,
-          initialEmaValues: [3260, 2330, 1560, 1000, 450, 80, 30],
           minPremiumLamports: new anchor.BN(0),
         } as any)
         .accounts({
@@ -149,7 +156,6 @@ describe("initialize", () => {
               observationSeconds: FAST_OBSERVATION,
               settlementDeadlineSeconds: FAST_SETTLEMENT_DEADLINE,
               claimExpirySeconds: FAST_CLAIM_EXPIRY,
-              initialEmaValues: [3260, 2330, 1560, 1000, 450, 80, 30],
               minPremiumLamports: new anchor.BN(0),
             } as any)
             .accounts({
@@ -183,7 +189,6 @@ describe("initialize", () => {
               observationSeconds: FAST_OBSERVATION,
               settlementDeadlineSeconds: FAST_SETTLEMENT_DEADLINE,
               claimExpirySeconds: FAST_CLAIM_EXPIRY,
-              initialEmaValues: [3260, 2330, 1560, 1000, 450, 80, 30],
               minPremiumLamports: new anchor.BN(0),
             } as any)
             .accounts({
@@ -215,7 +220,6 @@ describe("initialize", () => {
               observationSeconds: FAST_OBSERVATION,
               settlementDeadlineSeconds: FAST_SETTLEMENT_DEADLINE,
               claimExpirySeconds: FAST_CLAIM_EXPIRY,
-              initialEmaValues: [3260, 2330, 1560, 1000, 450, 80, 30],
               minPremiumLamports: new anchor.BN(0),
             } as any)
             .accounts({
@@ -247,7 +251,6 @@ describe("initialize", () => {
               observationSeconds: 0,
               settlementDeadlineSeconds: FAST_SETTLEMENT_DEADLINE,
               claimExpirySeconds: FAST_CLAIM_EXPIRY,
-              initialEmaValues: [3260, 2330, 1560, 1000, 450, 80, 30],
               minPremiumLamports: new anchor.BN(0),
             } as any)
             .accounts({
@@ -279,7 +282,6 @@ describe("initialize", () => {
               observationSeconds: FAST_OBSERVATION,
               settlementDeadlineSeconds: 0,
               claimExpirySeconds: FAST_CLAIM_EXPIRY,
-              initialEmaValues: [3260, 2330, 1560, 1000, 450, 80, 30],
               minPremiumLamports: new anchor.BN(0),
             } as any)
             .accounts({
@@ -311,7 +313,6 @@ describe("initialize", () => {
               observationSeconds: FAST_OBSERVATION,
               settlementDeadlineSeconds: FAST_SETTLEMENT_DEADLINE,
               claimExpirySeconds: 0,
-              initialEmaValues: [3260, 2330, 1560, 1000, 450, 80, 30],
               minPremiumLamports: new anchor.BN(0),
             } as any)
             .accounts({
@@ -343,7 +344,6 @@ describe("initialize", () => {
               observationSeconds: FAST_OBSERVATION,
               settlementDeadlineSeconds: FAST_SETTLEMENT_DEADLINE,
               claimExpirySeconds: FAST_CLAIM_EXPIRY,
-              initialEmaValues: [3260, 2330, 1560, 1000, 450, 80, 30],
               minPremiumLamports: new anchor.BN(0),
             } as any)
             .accounts({
@@ -375,7 +375,6 @@ describe("initialize", () => {
               observationSeconds: FAST_OBSERVATION,
               settlementDeadlineSeconds: FAST_SETTLEMENT_DEADLINE,
               claimExpirySeconds: FAST_CLAIM_EXPIRY,
-              initialEmaValues: [3260, 2330, 1560, 1000, 450, 80, 30],
               minPremiumLamports: new anchor.BN(0),
             } as any)
             .accounts({
@@ -408,7 +407,6 @@ describe("initialize", () => {
           observationSeconds: FAST_OBSERVATION,
           settlementDeadlineSeconds: FAST_SETTLEMENT_DEADLINE,
           claimExpirySeconds: FAST_CLAIM_EXPIRY,
-          initialEmaValues: [3260, 2330, 1560, 1000, 450, 80, 30],
           minPremiumLamports: new anchor.BN(0),
         } as any)
         .accounts({

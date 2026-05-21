@@ -1,9 +1,10 @@
 use anchor_lang::prelude::*;
 
-use crate::constants::{COHORT_SEED, EMA_STATE_SEED, GLOBAL_STATE_SEED, VAULT_SEED};
+use crate::constants::{COHORT_SEED, GLOBAL_STATE_SEED, NUM_STRIKES, VAULT_SEED};
 use crate::errors::MhiError;
 use crate::events::CohortStarted;
-use crate::state::{Cohort, CohortStatus, EmaState, GlobalState, Vault};
+use crate::math::ema::derive_strikes;
+use crate::state::{Cohort, CohortStatus, GlobalState, Vault};
 
 #[derive(Accounts)]
 pub struct StartCohort<'info> {
@@ -37,25 +38,29 @@ pub struct StartCohort<'info> {
     )]
     pub cohort: Account<'info, Cohort>,
 
-    #[account(
-        seeds = [EMA_STATE_SEED],
-        bump = ema_state.bump,
-    )]
-    pub ema_state: Account<'info, EmaState>,
-
     pub system_program: Program<'info, System>,
 }
 
-pub fn handler(ctx: Context<StartCohort>) -> Result<()> {
+pub fn handler(ctx: Context<StartCohort>, strikes: [u32; NUM_STRIKES]) -> Result<()> {
     let gs = &mut ctx.accounts.global_state;
     let clock = Clock::get()?;
     let now = clock.unix_timestamp;
 
-    // Verify EMA is seeded (at least one strike has non-zero premium)
-    // Without seeded EMA, premiums would be zero, allowing free calls
-    let ema = &ctx.accounts.ema_state;
-    let has_seeded_ema = ema.strikes.iter().any(|s| s.fast_ema_bps > 0 || s.slow_ema_bps > 0);
-    require!(has_seeded_ema, MhiError::InvalidConfig);
+    // Verify the keeper-supplied strikes are exactly what the on-chain anchor
+    // would derive. Strict equality — both sides use identical integer floor
+    // and the same multiplier table, so there is no rounding-tolerance argument.
+    // Catches: keeper running with a stale local anchor view (e.g., feeding raw
+    // unclamped MHI into its local strike-anchor instead of the chain's clamped
+    // value), or a mismatched multiplier constant.
+    let expected = derive_strikes(gs.strike_anchor_bps);
+    require!(strikes == expected, MhiError::StrikesDoNotMatchAnchor);
+
+    // Defense in depth: monotonic strikes are a property of `derive_strikes`
+    // when no slot hits the floor. Asserting it in storage means downstream
+    // code (settle, premium ladders) can rely on it without re-checking.
+    for i in 1..NUM_STRIKES {
+        require!(strikes[i] >= strikes[i - 1], MhiError::StrikesNotMonotonic);
+    }
 
     let trading_deadline = now
         .checked_add(gs.trading_window_seconds as i64)
@@ -63,7 +68,6 @@ pub fn handler(ctx: Context<StartCohort>) -> Result<()> {
     let measurement_deadline = trading_deadline
         .checked_add(gs.measurement_seconds as i64)
         .ok_or(MhiError::Overflow)?;
-    // settlement_deadline is from measurement end + observation
     let observation_end = measurement_deadline
         .checked_add(gs.observation_seconds as i64)
         .ok_or(MhiError::Overflow)?;
@@ -74,7 +78,6 @@ pub fn handler(ctx: Context<StartCohort>) -> Result<()> {
         .checked_add(gs.settlement_deadline_seconds as i64)
         .ok_or(MhiError::Overflow)?;
 
-    // Initialize cohort
     let cohort = &mut ctx.accounts.cohort;
     cohort.bump = ctx.bumps.cohort;
     cohort.index = gs.current_cohort_index;
@@ -93,18 +96,20 @@ pub fn handler(ctx: Context<StartCohort>) -> Result<()> {
     cohort.vault_collateral_locked = 0;
     cohort.vault_premiums_collected = 0;
     cohort.vault_payouts_due = 0;
-    cohort.strike_volume_lamports = [0u64; crate::constants::NUM_STRIKES];
+    cohort.strike_volume_lamports = [0u64; NUM_STRIKES];
     cohort.p2p_collateral_locked = 0;
     cohort.p2p_premiums_collected = 0;
     cohort.p2p_payouts_due = 0;
     cohort.p2p_positions = 0;
     cohort.p2p_positions_settled = 0;
-    cohort.p2p_strike_collateral = [0u64; crate::constants::NUM_STRIKES];
+    cohort.p2p_strike_collateral = [0u64; NUM_STRIKES];
     cohort.positions_voided = 0;
     cohort.outstanding_positions = 0;
     cohort.outstanding_p2p_positions = 0;
+    cohort.strikes = strikes;
+    cohort.strike_anchor_bps_at_start = gs.strike_anchor_bps;
+    cohort.mhi_cap_bps_at_start = gs.mhi_cap_bps;
 
-    // Update global state
     gs.active_cohorts = gs.active_cohorts.checked_add(1).ok_or(MhiError::Overflow)?;
     gs.current_cohort_index = gs.current_cohort_index.checked_add(1).ok_or(MhiError::Overflow)?;
     gs.total_cohorts = gs.total_cohorts.checked_add(1).ok_or(MhiError::Overflow)?;
@@ -113,6 +118,8 @@ pub fn handler(ctx: Context<StartCohort>) -> Result<()> {
         index: cohort.index,
         trading_start: now,
         trading_deadline,
+        strikes,
+        strike_anchor_bps: cohort.strike_anchor_bps_at_start,
     });
 
     Ok(())

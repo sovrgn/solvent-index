@@ -1,11 +1,10 @@
 import { expect } from "chai";
 import {
   setupProtocol, TestCtx, expectError,
-  startCohort, buyCall, warpPastObservation, submitMhi, settleBatch,
-  claimPosition, warpTime, accountExists, getBalance,
-  voidCohort, SOL,
+  startCohort, warpPastObservation, submitMhi, settleBatch,
+  warpTime, accountExists, getBalance,
+  voidCohort, currentAtmStrike,
   FAST_SETTLEMENT_DEADLINE, FAST_CLAIM_EXPIRY,
-  FAST_TRADING_WINDOW, FAST_MEASUREMENT, FAST_OBSERVATION,
 } from "./_setup";
 
 describe("close_cohort", () => {
@@ -19,6 +18,9 @@ describe("close_cohort", () => {
       .accounts({
         caller: caller.publicKey,
         globalState: t.globalState,
+        // Rent refund destination — anyone can trigger the close, but rent
+        // always goes back to the authority. The authority is NOT a signer here.
+        authority: t.authority.publicKey,
         cohort,
       } as any)
       .signers([caller])
@@ -27,20 +29,23 @@ describe("close_cohort", () => {
 
 
   describe("happy path", () => {
-    it("closes settled cohort after claim expiry - PDA gone, rent to caller", async () => {
+    it("closes settled cohort after claim expiry - PDA gone, rent to authority", async () => {
       const cohort = await startCohort(t);
       await warpPastObservation(t.context);
-      await submitMhi(t, cohort, 12_000);
+      await submitMhi(t, cohort, await currentAtmStrike(t));
       await settleBatch(t, cohort, []);
 
       await warpTime(t.context, FAST_SETTLEMENT_DEADLINE + FAST_CLAIM_EXPIRY + 3);
 
-      const callerBefore = await getBalance(t.context.banksClient, t.randomUser.publicKey);
+      const authorityBefore = await getBalance(t.context.banksClient, t.authority.publicKey);
       await closeCohort(cohort);
-      const callerAfter = await getBalance(t.context.banksClient, t.randomUser.publicKey);
+      const authorityAfter = await getBalance(t.context.banksClient, t.authority.publicKey);
 
       expect(await accountExists(t.context.banksClient, cohort)).to.be.false;
-      expect(callerAfter).to.be.greaterThan(callerBefore);
+      // close = authority sends the rent refund to the protocol authority,
+      // not the caller. Caller pays the tx fee and is incentivized only by
+      // the gas market, not the rent recovery.
+      expect(authorityAfter).to.be.greaterThan(authorityBefore);
     });
 
     it("closes voided cohort after claim expiry", async () => {
@@ -65,7 +70,7 @@ describe("close_cohort", () => {
     it("close settled cohort before claim expiry → ClaimNotExpired", async () => {
       const cohort = await startCohort(t);
       await warpPastObservation(t.context);
-      await submitMhi(t, cohort, 12_000);
+      await submitMhi(t, cohort, await currentAtmStrike(t));
       await settleBatch(t, cohort, []);
 
       // Don't warp past claim expiry

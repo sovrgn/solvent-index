@@ -5,11 +5,10 @@ import {
   setupProtocol, TestCtx, expectError,
   startCohort, buyCall, warpPastObservation, submitMhi, settleBatch,
   claimPosition, warpTime, assertVaultConservation,
-  voidCohort, runFullCohort, SOL, getBalance, accountExists,
-  fundedKeypair, findPositionPda, findCohortPda,
+  voidCohort, SOL, accountExists,
+  currentAtmStrike,
   FAST_TRADING_WINDOW, FAST_MEASUREMENT, FAST_OBSERVATION,
   FAST_SETTLEMENT_DEADLINE, FAST_CLAIM_EXPIRY, MHI_CAP_BPS,
-  DEFAULT_STRIKES_BPS,
 } from "./_setup";
 
 describe("19 - remaining edge cases", () => {
@@ -34,7 +33,7 @@ describe("19 - remaining edge cases", () => {
           observationSeconds: FAST_OBSERVATION,
           settlementDeadlineSeconds: FAST_SETTLEMENT_DEADLINE,
           claimExpirySeconds: FAST_CLAIM_EXPIRY,
-          initialEmaValues: [0, 0, 0, 0, 0, 0, 0],
+          
           minPremiumLamports: new anchor.BN(0),
         } as any)
         .accounts({
@@ -58,35 +57,25 @@ describe("19 - remaining edge cases", () => {
         .rpc();
     });
 
-    it("initialize with all-zero EMA → start_cohort rejects with InvalidConfig", async () => {
-      // EMA state should have all zeros
+    it("initialize with empty EMA + MIN_PREMIUM_BPS_FLOOR keeps buy_call solvent at cold start", async () => {
+      // Sanity: EMA slots are all zero on fresh init.
       const ema = await t.program.account.emaState.fetch(t.emaState);
       for (let i = 0; i < 7; i++) {
-        expect(ema.strikes[i].fastEmaBps).to.equal(0);
-        expect(ema.strikes[i].slowEmaBps).to.equal(0);
+        expect((ema as any).slots[i].fastFracBps).to.equal(0);
+        expect((ema as any).slots[i].slowFracBps).to.equal(0);
       }
 
-      // With L2 EMA seeding enforcement, start_cohort rejects when EMA is all zeros
-      const gs = await t.program.account.globalState.fetch(t.globalState);
-      const idx = gs.currentCohortIndex.toNumber();
-      const [cohortPda] = findCohortPda(t.program.programId, idx);
+      // Old design required pre-seeded EMA values and rejected start_cohort
+      // when they were all zero. The new design removes that gate — cold-start
+      // markup amplification + MIN_PREMIUM_BPS_FLOOR in buy_call together
+      // ensure the cold-start exploit is impossible without needing a seed.
+      const cohort = await startCohort(t);
+      const pos = await buyCall(t, cohort);
+      const posData = await t.program.account.position.fetch(pos);
+      // Premium ≥ MIN_PREMIUM_BPS_FLOOR (50 bps) × size, so non-trivially > 0.
+      expect(posData.premiumPaidLamports.toNumber()).to.be.greaterThanOrEqual(1);
 
-      await expectError(
-        () =>
-          t.program.methods
-            .startCohort()
-            .accounts({
-              keeper: t.keeper.publicKey,
-              globalState: t.globalState,
-              vault: t.vault,
-              emaState: t.emaState,
-              cohort: cohortPda,
-              systemProgram: SystemProgram.programId,
-            } as any)
-            .signers([t.keeper])
-            .rpc(),
-        "InvalidConfig",
-      );
+      await voidCohort(t, cohort, [pos]);
     });
   });
 
@@ -165,7 +154,7 @@ describe("19 - remaining edge cases", () => {
       expect(ema.markupBps).to.equal(2000); // MARKUP_DEFAULT_BPS
 
       const pos0 = await buyCall(t, cohort0, {
-        strikeBps: 12_000,
+        strikeBps: await currentAtmStrike(t),
         size: SOL(0.05),
         nonce: 0,
       });
@@ -197,7 +186,7 @@ describe("19 - remaining edge cases", () => {
       const cohort = await startCohort(t);
 
       // Buy a position so the cohort is definitely in use
-      const pos = await buyCall(t, cohort, { strikeBps: 12_000 });
+      const pos = await buyCall(t, cohort, { strikeBps: await currentAtmStrike(t) });
 
       const gsBefore = await t.program.account.globalState.fetch(t.globalState);
       const oldFeeBps = gsBefore.premiumFeeBps;
@@ -234,10 +223,11 @@ describe("19 - remaining edge cases", () => {
 
     it("vault conservation holds immediately after claim", async () => {
       const cohort = await startCohort(t);
-      const pos = await buyCall(t, cohort, { strikeBps: 12_000, size: SOL(0.1) });
+      const pos = await buyCall(t, cohort, { strikeBps: await currentAtmStrike(t), size: SOL(0.1) });
 
       await warpPastObservation(t.context);
-      await submitMhi(t, cohort, 15_000); // ITM
+      // ITM submission: 5_000 bps above the ATM live strike.
+      await submitMhi(t, cohort, (await currentAtmStrike(t)) + 5_000);
       await settleBatch(t, cohort, [pos]);
 
       const posData = await t.program.account.position.fetch(pos);
@@ -260,10 +250,11 @@ describe("19 - remaining edge cases", () => {
 
     it("vault conservation holds immediately after expire", async () => {
       const cohort = await startCohort(t);
-      const pos = await buyCall(t, cohort, { strikeBps: 12_000, size: SOL(0.1) });
+      const pos = await buyCall(t, cohort, { strikeBps: await currentAtmStrike(t), size: SOL(0.1) });
 
       await warpPastObservation(t.context);
-      await submitMhi(t, cohort, 15_000); // ITM
+      // ITM submission: 5_000 bps above the ATM live strike.
+      await submitMhi(t, cohort, (await currentAtmStrike(t)) + 5_000);
       await settleBatch(t, cohort, [pos]);
 
       const posData = await t.program.account.position.fetch(pos);

@@ -1,15 +1,13 @@
 import { expect } from "chai";
-import * as anchor from "@coral-xyz/anchor";
-import { Keypair, SystemProgram, PublicKey } from "@solana/web3.js";
+import { SystemProgram, PublicKey } from "@solana/web3.js";
 import {
   setupProtocol, TestCtx, expectError,
   startCohort, buyCall, warpPastObservation, submitMhi, settleBatch,
-  claimPosition, warpTime, warpToTimestamp, assertVaultConservation,
-  voidCohort, runFullCohort, SOL, getBalance, accountExists,
-  fundedKeypair, findPositionPda, findCohortPda,
-  FAST_TRADING_WINDOW, FAST_MEASUREMENT, FAST_OBSERVATION,
-  FAST_SETTLEMENT_DEADLINE, FAST_CLAIM_EXPIRY, MHI_CAP_BPS,
-  DEFAULT_STRIKES_BPS, NUM_STRIKES,
+  claimPosition, warpTime,
+  voidCohort, runFullCohort, SOL,
+  findPositionPda,
+  currentAtmStrike, currentLiveStrikes,
+  FAST_TRADING_WINDOW,
 } from "./_setup";
 
 describe("17 - missing errors and state verification", () => {
@@ -25,22 +23,23 @@ describe("17 - missing errors and state verification", () => {
 
     it("buying with same strike + same nonce twice fails with 'already in use'", async () => {
       const cohort = await startCohort(t);
+      const atm = await currentAtmStrike(t);
 
       // First buy succeeds
-      await buyCall(t, cohort, { strikeBps: 12_000, nonce: 0 });
+      await buyCall(t, cohort, { strikeBps: atm, nonce: 0 });
 
       // Warp for fresh blockhash (identical instruction bytes otherwise)
       await warpTime(t.context, 1);
 
       // Second buy with identical strike + nonce should fail - PDA already initialized
       const [posPda] = findPositionPda(
-        t.program.programId, cohort, t.buyer.publicKey, 12_000, 0,
+        t.program.programId, cohort, t.buyer.publicKey, atm, 0,
       );
 
       await expectError(
         () =>
           t.program.methods
-            .buyCall(12_000, SOL(0.05), 0)
+            .buyCall(atm, SOL(0.05), 0)
             .accounts({
               buyer: t.buyer.publicKey,
               globalState: t.globalState,
@@ -107,7 +106,7 @@ describe("17 - missing errors and state verification", () => {
 
     it("settle without MHI submitted → MhiNotSubmitted", async () => {
       const cohort = await startCohort(t);
-      const pos = await buyCall(t, cohort, { strikeBps: 12_000 });
+      const pos = await buyCall(t, cohort);
       await warpPastObservation(t.context);
 
       // Do NOT submit MHI - try to settle directly
@@ -117,7 +116,7 @@ describe("17 - missing errors and state verification", () => {
       );
 
       // Cleanup: submit MHI, settle, claim
-      await submitMhi(t, cohort, 14_000);
+      await submitMhi(t, cohort, await currentAtmStrike(t));
       await settleBatch(t, cohort, [pos]);
       await claimPosition(t, cohort, pos, t.buyer);
     });
@@ -146,16 +145,16 @@ describe("17 - missing errors and state verification", () => {
 
     it("at least one strike EMA changes after submitMhi", async () => {
       const emaBefore = await t.program.account.emaState.fetch(t.emaState);
-      const emaValuesBefore = emaBefore.strikes.map(
-        (e: any) => e.fastEmaBps,
+      const emaValuesBefore = (emaBefore as any).slots.map(
+        (e: any) => e.fastFracBps,
       );
 
       // Run a full cohort to trigger EMA update via submitMhi
-      await runFullCohort(t, 14_000, [{ strikeBps: 12_000 }]);
+      await runFullCohort(t, 14_000, [{}]);
 
       const emaAfter = await t.program.account.emaState.fetch(t.emaState);
-      const emaValuesAfter = emaAfter.strikes.map(
-        (e: any) => e.fastEmaBps,
+      const emaValuesAfter = (emaAfter as any).slots.map(
+        (e: any) => e.fastFracBps,
       );
 
       // At least one EMA value should have changed
@@ -185,9 +184,9 @@ describe("17 - missing errors and state verification", () => {
 
       const size = SOL(0.05);
       const cohort = await startCohort(t);
-      const pos = await buyCall(t, cohort, { strikeBps: 12_000, size });
+      const pos = await buyCall(t, cohort, { size });
       await warpPastObservation(t.context);
-      await submitMhi(t, cohort, 14_000);
+      await submitMhi(t, cohort, await currentAtmStrike(t));
 
       const gsAfter = await t.program.account.globalState.fetch(t.globalState);
       const volumeAfter = gsAfter.totalVolumeLamports.toNumber();
@@ -214,11 +213,12 @@ describe("17 - missing errors and state verification", () => {
 
     it("settles 1, then 2 more - counter goes 1 then 3", async () => {
       const cohort = await startCohort(t);
-      const pos1 = await buyCall(t, cohort, { strikeBps: 10_000, nonce: 0 });
-      const pos2 = await buyCall(t, cohort, { strikeBps: 12_000, nonce: 1 });
-      const pos3 = await buyCall(t, cohort, { strikeBps: 15_000, nonce: 2 });
+      const live = await currentLiveStrikes(t);
+      const pos1 = await buyCall(t, cohort, { strikeBps: live[0], nonce: 0 });
+      const pos2 = await buyCall(t, cohort, { strikeBps: live[2], nonce: 1 });
+      const pos3 = await buyCall(t, cohort, { strikeBps: live[5], nonce: 2 });
       await warpPastObservation(t.context);
-      await submitMhi(t, cohort, 14_000);
+      await submitMhi(t, cohort, live[3]!);
 
       // Settle 1 position
       await settleBatch(t, cohort, [pos1]);
@@ -247,14 +247,13 @@ describe("17 - missing errors and state verification", () => {
     before(async () => { t = await setupProtocol(); });
 
     it("MHI exactly at strike → payout = 0", async () => {
-      const strike = 12_000;
       const cohort = await startCohort(t);
+      const strike = await currentAtmStrike(t);
       const pos = await buyCall(t, cohort, { strikeBps: strike });
       await warpPastObservation(t.context);
 
-      // Submit MHI equal to the strike (ATM). Note: clamping may adjust this
-      // if lastMhiBps is far from 12_000, but the clamped value is what
-      // matters. We read the actual cohort MHI after submission.
+      // Submit MHI equal to the strike (ATM). Clamping may adjust if
+      // lastMhiBps is far away — we read the actual stored MHI after.
       await submitMhi(t, cohort, strike);
 
       const cohortData = await t.program.account.cohort.fetch(cohort);
@@ -294,10 +293,11 @@ describe("17 - missing errors and state verification", () => {
 
     it("re-settling [settled, unsettled] succeeds - only unsettled settles", async () => {
       const cohort = await startCohort(t);
-      const pos1 = await buyCall(t, cohort, { strikeBps: 12_000, nonce: 0 });
-      const pos2 = await buyCall(t, cohort, { strikeBps: 15_000, nonce: 1 });
+      const live = await currentLiveStrikes(t);
+      const pos1 = await buyCall(t, cohort, { strikeBps: live[2], nonce: 0 });
+      const pos2 = await buyCall(t, cohort, { strikeBps: live[5], nonce: 1 });
       await warpPastObservation(t.context);
-      await submitMhi(t, cohort, 14_000);
+      await submitMhi(t, cohort, live[3]!);
 
       // Settle pos1 only (partial)
       await settleBatch(t, cohort, [pos1]);
@@ -332,19 +332,20 @@ describe("17 - missing errors and state verification", () => {
 
     it("buying after trading window closes → TradingWindowClosed", async () => {
       const cohort = await startCohort(t);
+      const atm = await currentAtmStrike(t);
 
       // Warp past trading window but NOT past observation
       // (cohort is in Measuring state)
       await warpTime(t.context, FAST_TRADING_WINDOW + 1);
 
       const [posPda] = findPositionPda(
-        t.program.programId, cohort, t.buyer.publicKey, 12_000, 0,
+        t.program.programId, cohort, t.buyer.publicKey, atm, 0,
       );
 
       await expectError(
         () =>
           t.program.methods
-            .buyCall(12_000, SOL(0.05), 0)
+            .buyCall(atm, SOL(0.05), 0)
             .accounts({
               buyer: t.buyer.publicKey,
               globalState: t.globalState,

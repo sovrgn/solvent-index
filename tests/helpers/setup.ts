@@ -3,7 +3,6 @@ import { Program } from "@coral-xyz/anchor";
 import { Keypair, PublicKey, SystemProgram, LAMPORTS_PER_SOL } from "@solana/web3.js";
 import { Mhi } from "../../target/types/mhi";
 import { findGlobalStatePda, findVaultPda, findEmaStatePda } from "./accounts";
-import { NUM_STRIKES, DEFAULT_STRIKES_BPS } from "./constants";
 
 export interface TestContext {
   program: Program<Mhi>;
@@ -28,7 +27,6 @@ export async function initializeProtocol(
     observationSeconds?: number;
     settlementDeadlineSeconds?: number;
     claimExpirySeconds?: number;
-    initialEmaValues?: number[];
   }
 ): Promise<TestContext> {
   const authority = (provider.wallet as anchor.Wallet).payer;
@@ -45,12 +43,6 @@ export async function initializeProtocol(
   const [vault] = findVaultPda(program.programId);
   const [emaState] = findEmaStatePda(program.programId);
 
-  // Default EMA values (from empirical data - non-zero to pass premium floor check)
-  const defaultEma = overrides?.initialEmaValues ?? [3260, 2330, 1560, 1000, 450, 80, 30];
-
-  // Pad or trim to NUM_STRIKES
-  const initialEmaValues = Array.from({ length: NUM_STRIKES }, (_, i) => defaultEma[i] ?? 0);
-
   await program.methods
     .initialize({
       keeper: keeper.publicKey,
@@ -58,20 +50,20 @@ export async function initializeProtocol(
       premiumFeeBps: 150,
       referralShareBps: 3000,
       minPositionLamports: new anchor.BN(10_000_000), // 0.01 SOL
+      minPremiumLamports: new anchor.BN(0),
       tradingWindowSeconds: overrides?.tradingWindowSeconds ?? 180,
       measurementSeconds: overrides?.measurementSeconds ?? 900,
       observationSeconds: overrides?.observationSeconds ?? 300,
       settlementDeadlineSeconds: overrides?.settlementDeadlineSeconds ?? 1800,
       claimExpirySeconds: overrides?.claimExpirySeconds ?? 86400,
-      initialEmaValues: initialEmaValues,
-    })
+    } as any)
     .accounts({
       authority: authority.publicKey,
       globalState,
       vault,
       emaState,
       systemProgram: SystemProgram.programId,
-    })
+    } as any)
     .rpc();
 
   return { program, provider, authority, keeper, globalState, vault, emaState };

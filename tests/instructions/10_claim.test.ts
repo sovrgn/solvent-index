@@ -1,10 +1,11 @@
 import { expect } from "chai";
-import { PublicKey, SystemProgram } from "@solana/web3.js";
+import { SystemProgram } from "@solana/web3.js";
 import {
   setupProtocol, TestCtx, expectError,
   startCohort, buyCall, warpPastObservation, submitMhi, settleBatch,
   claimPosition, warpTime, getBalance, accountExists,
-  assertVaultConservation, SOL, FAST_CLAIM_EXPIRY, fundedKeypair,
+  assertVaultConservation, currentLiveStrikes, currentAtmStrike,
+  FAST_CLAIM_EXPIRY,
 } from "./_setup";
 
 describe("claim", () => {
@@ -16,9 +17,10 @@ describe("claim", () => {
   describe("happy path", () => {
     it("owner claims settled ITM position - payout transferred, PDA closed", async () => {
       const cohort = await startCohort(t);
-      const pos = await buyCall(t, cohort, { strikeBps: 12_000 });
+      const live = await currentLiveStrikes(t);
+      const pos = await buyCall(t, cohort, { strikeBps: live[2] }); // ATM
       await warpPastObservation(t.context);
-      await submitMhi(t, cohort, 15_000); // ITM
+      await submitMhi(t, cohort, live[5]!); // well above ATM → ITM
       await settleBatch(t, cohort, [pos]);
 
       const posData = await t.program.account.position.fetch(pos);
@@ -36,9 +38,10 @@ describe("claim", () => {
 
     it("claim OTM position (payout=0) - PDA closed, no SOL transferred", async () => {
       const cohort = await startCohort(t);
-      const pos = await buyCall(t, cohort, { strikeBps: 20_000 }); // far OTM
+      const live = await currentLiveStrikes(t);
+      const pos = await buyCall(t, cohort, { strikeBps: live[6] }); // highest = most-OTM
       await warpPastObservation(t.context);
-      await submitMhi(t, cohort, 12_000); // below all strikes
+      await submitMhi(t, cohort, live[0]!); // mhi below every strike → OTM
       await settleBatch(t, cohort, [pos]);
 
       const posData = await t.program.account.position.fetch(pos);
@@ -54,9 +57,10 @@ describe("claim", () => {
   describe("third-party claim", () => {
     it("non-owner calls claim - payout goes to owner, rent to caller", async () => {
       const cohort = await startCohort(t);
-      const pos = await buyCall(t, cohort, { strikeBps: 12_000 });
+      const live = await currentLiveStrikes(t);
+      const pos = await buyCall(t, cohort, { strikeBps: live[2] });
       await warpPastObservation(t.context);
-      await submitMhi(t, cohort, 15_000);
+      await submitMhi(t, cohort, live[5]!);
       await settleBatch(t, cohort, [pos]);
 
       const ownerBefore = await getBalance(t.context.banksClient, t.buyer.publicKey);
@@ -73,13 +77,12 @@ describe("claim", () => {
       const cohort = await startCohort(t);
       const pos = await buyCall(t, cohort);
       await warpPastObservation(t.context);
-      await submitMhi(t, cohort);
+      await submitMhi(t, cohort, await currentAtmStrike(t));
       // Don't settle - try to claim directly
       await expectError(
         () => claimPosition(t, cohort, pos, t.buyer),
         "NotSettled",
       );
-      // cleanup
       await settleBatch(t, cohort, [pos]);
       await claimPosition(t, cohort, pos, t.buyer);
     });
@@ -88,12 +91,11 @@ describe("claim", () => {
       const cohort = await startCohort(t);
       const pos = await buyCall(t, cohort);
       await warpPastObservation(t.context);
-      await submitMhi(t, cohort);
+      await submitMhi(t, cohort, await currentAtmStrike(t));
       await settleBatch(t, cohort, [pos]);
       await claimPosition(t, cohort, pos, t.buyer);
 
       await warpTime(t.context, 1);
-      // Anchor finds the account zeroed/system-owned → AccountNotInitialized (3012)
       await expectError(
         () => claimPosition(t, cohort, pos, t.buyer),
         "AccountNotInitialized",
@@ -102,9 +104,10 @@ describe("claim", () => {
 
     it("claim after deadline → ClaimExpired", async () => {
       const cohort = await startCohort(t);
-      const pos = await buyCall(t, cohort, { strikeBps: 12_000 });
+      const live = await currentLiveStrikes(t);
+      const pos = await buyCall(t, cohort, { strikeBps: live[2] });
       await warpPastObservation(t.context);
-      await submitMhi(t, cohort, 15_000);
+      await submitMhi(t, cohort, live[5]!);
       await settleBatch(t, cohort, [pos]);
 
       await warpTime(t.context, FAST_CLAIM_EXPIRY + 1);
@@ -114,7 +117,6 @@ describe("claim", () => {
         "ClaimExpired",
       );
 
-      // cleanup: expire the position
       await t.program.methods
         .expirePosition()
         .accounts({

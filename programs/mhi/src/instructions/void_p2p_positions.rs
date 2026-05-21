@@ -74,9 +74,11 @@ pub fn handler<'info>(
         let refund = position.writer_premium_lamports;
         total_refunds += refund;
 
-        // Compute the collateral that was locked for this position
+        // Compute the collateral that was locked for this position.
+        // Use the cohort's at-start cap snapshot, not the live global cap —
+        // authority cannot retroactively change the cap that sized the lock.
         let collateral = crate::math::payoff::total_collateral_lamports_ceil(
-            ctx.accounts.global_state.mhi_cap_bps,
+            ctx.accounts.cohort.mhi_cap_bps_at_start,
             position.strike_bps,
             position.size_lamports,
         ).ok_or(MhiError::Overflow)?;

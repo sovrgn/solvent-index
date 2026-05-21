@@ -46,8 +46,11 @@ pub mod mhi {
     }
 
 
-    pub fn start_cohort(ctx: Context<StartCohort>) -> Result<()> {
-        instructions::start_cohort::handler(ctx)
+    pub fn start_cohort(
+        ctx: Context<StartCohort>,
+        strikes: [u32; crate::constants::NUM_STRIKES],
+    ) -> Result<()> {
+        instructions::start_cohort::handler(ctx, strikes)
     }
 
     pub fn submit_mhi(

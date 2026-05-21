@@ -3,8 +3,9 @@ import { SystemProgram } from "@solana/web3.js";
 import {
   setupProtocol, TestCtx, expectError,
   startCohort, buyCall, warpPastObservation, submitMhi, settleBatch,
-  claimPosition, warpTime, getBalance, accountExists,
-  assertVaultConservation, SOL, FAST_CLAIM_EXPIRY,
+  claimPosition, warpTime, accountExists,
+  assertVaultConservation, currentLiveStrikes, currentAtmStrike,
+  FAST_CLAIM_EXPIRY,
 } from "./_setup";
 
 describe("expire_position", () => {
@@ -30,9 +31,10 @@ describe("expire_position", () => {
   describe("happy path", () => {
     it("after claim deadline, anyone expires - payout returns to vault available", async () => {
       const cohort = await startCohort(t);
-      const pos = await buyCall(t, cohort, { strikeBps: 12_000 });
+      const live = await currentLiveStrikes(t);
+      const pos = await buyCall(t, cohort, { strikeBps: live[2] });
       await warpPastObservation(t.context);
-      await submitMhi(t, cohort, 15_000); // ITM
+      await submitMhi(t, cohort, live[5]!); // ITM
       await settleBatch(t, cohort, [pos]);
 
       const posData = await t.program.account.position.fetch(pos);
@@ -57,9 +59,10 @@ describe("expire_position", () => {
 
     it("expire OTM position (payout=0) - PDA closed, no vault accounting change", async () => {
       const cohort = await startCohort(t);
-      const pos = await buyCall(t, cohort, { strikeBps: 20_000 });
+      const live = await currentLiveStrikes(t);
+      const pos = await buyCall(t, cohort, { strikeBps: live[6] }); // most-OTM
       await warpPastObservation(t.context);
-      await submitMhi(t, cohort, 12_000); // all OTM
+      await submitMhi(t, cohort, live[0]!); // below all strikes → OTM
       await settleBatch(t, cohort, [pos]);
 
       await warpTime(t.context, FAST_CLAIM_EXPIRY + 1);
@@ -81,7 +84,7 @@ describe("expire_position", () => {
       const cohort = await startCohort(t);
       const pos = await buyCall(t, cohort);
       await warpPastObservation(t.context);
-      await submitMhi(t, cohort);
+      await submitMhi(t, cohort, await currentAtmStrike(t));
       await settleBatch(t, cohort, [pos]);
 
       // Don't warp - try immediately
@@ -98,7 +101,7 @@ describe("expire_position", () => {
       const cohort = await startCohort(t);
       const pos = await buyCall(t, cohort);
       await warpPastObservation(t.context);
-      await submitMhi(t, cohort);
+      await submitMhi(t, cohort, await currentAtmStrike(t));
       // Don't settle
 
       await warpTime(t.context, FAST_CLAIM_EXPIRY + 1);

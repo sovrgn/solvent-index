@@ -1,11 +1,11 @@
 use anchor_lang::prelude::*;
 
-use crate::constants::{COHORT_SEED, EMA_STATE_SEED, GLOBAL_STATE_SEED, VAULT_SEED};
+use crate::constants::{COHORT_SEED, EMA_STATE_SEED, GLOBAL_STATE_SEED, NUM_STRIKES, VAULT_SEED};
 use crate::errors::MhiError;
 use crate::events::MhiSubmitted;
 use crate::math::bps::clamp_delta_bps;
-use crate::math::ema::update_emas_for_strike;
-use crate::math::premium::{adjust_markup, adjust_strike_demand_markup, strike_share_bps, utilization_bps};
+use crate::math::ema::{update_slot_frac_emas, update_strike_anchor};
+use crate::math::premium::{adjust_strike_demand_markup, strike_share_bps};
 use crate::state::{Cohort, CohortStatus, EmaState, GlobalState, Vault};
 
 #[derive(Accounts)]
@@ -49,14 +49,22 @@ pub fn handler(
     token_count: u16,
     cohort_hash: [u8; 32],
 ) -> Result<()> {
-    let gs = &ctx.accounts.global_state;
-    let cohort = &mut ctx.accounts.cohort;
-    let ema = &mut ctx.accounts.ema_state;
     let clock = Clock::get()?;
 
+    // Snapshot the inputs we need before we take mutable borrows. The cap
+    // we settle against is the cohort's at-start snapshot, not the current
+    // global cap — `update_config { mhi_cap_bps }` mid-flight must not
+    // change in-flight cohort economics.
+    let mhi_cap_bps = ctx.accounts.cohort.mhi_cap_bps_at_start;
+    let global_mhi_cap_bps = ctx.accounts.global_state.mhi_cap_bps;
+    let mhi_max_delta_bps = ctx.accounts.global_state.mhi_max_delta_bps;
+    let last_mhi_bps = ctx.accounts.global_state.last_mhi_bps;
+    let prev_anchor_bps = ctx.accounts.global_state.strike_anchor_bps;
+    let prev_settlement_count = ctx.accounts.global_state.strike_anchor_settlement_count;
+    let observation_seconds = ctx.accounts.global_state.observation_seconds;
 
-    // Must be in Measuring status (trading deadline passed)
-    // The status is still "Trading" on-chain but we check clock
+    let cohort = &mut ctx.accounts.cohort;
+
     require!(
         cohort.status == CohortStatus::Trading || cohort.status == CohortStatus::Measuring,
         MhiError::InvalidCohortStatus
@@ -66,103 +74,102 @@ pub fn handler(
         MhiError::TradingWindowOpen
     );
 
-    // Observation must be complete
     let observation_end = cohort
         .measurement_deadline
-        .checked_add(gs.observation_seconds as i64)
+        .checked_add(observation_seconds as i64)
         .ok_or(MhiError::Overflow)?;
     require!(
         clock.unix_timestamp >= observation_end,
         MhiError::ObservationNotComplete
     );
 
-    // MHI not already submitted
     require!(!cohort.has_mhi(), MhiError::MhiAlreadySubmitted);
 
-    // Validate MHI value
     require!(mhi_bps > 0, MhiError::MhiZero);
-    require!(mhi_bps <= gs.mhi_cap_bps, MhiError::MhiExceedsCap);
+    // Validate against both the cohort's at-start cap (settlement uses that)
+    // AND the current global cap (which the keeper's UI is quoting against).
+    // If the authority *lowered* the cap mid-flight, the cohort still settles
+    // against its higher original cap — but submissions must respect the new
+    // cap so the keeper's UX stays consistent with config.
+    require!(mhi_bps <= mhi_cap_bps, MhiError::MhiExceedsCap);
+    require!(mhi_bps <= global_mhi_cap_bps, MhiError::MhiExceedsCap);
+    require!(
+        token_count >= crate::constants::MIN_COHORT_TOKENS,
+        MhiError::InvalidConfig
+    );
 
-    //
-    // The keeper submits any value. The program clamps it so it cannot
-    // move more than mhi_max_delta_bps% from the previous cohort's MHI.
-    //
-    // This does NOT reject the submission - it accepts a clamped value.
-    // Any target can be reached over multiple cohorts. A compromised
-    // keeper must sustain false submissions across many cohorts to walk
-    // the MHI to an extreme, giving monitoring time to detect and rotate.
-    //
-    // Example with 33% clamp (mhi_max_delta_bps=3300):
-    //   Legitimate crash 1.27→0.50: takes 3 cohorts (~75 min) to fully reflect
-    //   Compromised keeper 1.27→0.01: takes 6+ cohorts (~150 min), all obviously wrong
-    //
-    // First cohort (last_mhi_bps==0) is unclamped. delta_bps==0 disables clamping.
-    let effective_mhi = clamp_delta_bps(mhi_bps, gs.last_mhi_bps, gs.mhi_max_delta_bps);
-
-    // Validate token count
-    require!(token_count >= crate::constants::MIN_COHORT_TOKENS, MhiError::InvalidConfig);
-
+    // Drift-style clamp. The keeper submits any value, we clamp to ±delta from
+    // the previous cohort's MHI (with an absolute floor). The clamped value is
+    // what we record and feed into anchor/EMA updates — never the raw input.
+    let effective_mhi = clamp_delta_bps(mhi_bps, last_mhi_bps, mhi_max_delta_bps);
 
     cohort.status = CohortStatus::Measuring;
     cohort.mhi_bps = effective_mhi;
     cohort.token_count = token_count;
     cohort.cohort_hash = cohort_hash;
 
-
-    for strike_ema in ema.strikes.iter_mut() {
-        if strike_ema.strike_bps == 0 {
-            continue; // Skip uninitialized slots
-        }
-        let (new_fast, new_slow) = update_emas_for_strike(
-            effective_mhi,
-            strike_ema.strike_bps,
-            strike_ema.fast_ema_bps,
-            strike_ema.slow_ema_bps,
-        )
-        .ok_or(MhiError::Overflow)?;
-        strike_ema.fast_ema_bps = new_fast;
-        strike_ema.slow_ema_bps = new_slow;
-    }
-    ema.last_updated_cohort = cohort.index;
-
-    // Each strike's demand markup adjusts based on its share of total volume.
+    let cohort_strikes = cohort.strikes;
+    let cohort_anchor_at_start = cohort.strike_anchor_bps_at_start;
     let total_vol = cohort.total_call_volume_lamports;
-    for (i, strike_ema) in ema.strikes.iter_mut().enumerate() {
-        if strike_ema.strike_bps == 0 {
+    let cohort_index = cohort.index;
+    // Per-slot strike volumes — copy out before we mutate ema_state.
+    let strike_volumes = cohort.strike_volume_lamports;
+    let cohort_volume_for_global = cohort.total_call_volume_lamports;
+
+    let ema = &mut ctx.accounts.ema_state;
+
+    // Fractional EMA update per slot. Uses the cohort's anchor snapshot as the
+    // denominator — NOT the current global anchor, because later cohorts may
+    // have already shifted it before this one settled.
+    for i in 0..NUM_STRIKES {
+        let strike = cohort_strikes[i];
+        if strike == 0 {
             continue;
         }
-        let strike_vol = cohort.strike_volume_lamports[i];
-        let share = strike_share_bps(strike_vol, total_vol);
-        strike_ema.demand_markup_bps = adjust_strike_demand_markup(
-            strike_ema.demand_markup_bps,
-            share,
-        );
+        let (new_fast, new_slow) = update_slot_frac_emas(
+            effective_mhi,
+            strike,
+            cohort_anchor_at_start,
+            mhi_cap_bps,
+            ema.slots[i].fast_frac_bps,
+            ema.slots[i].slow_frac_bps,
+        )
+        .ok_or(MhiError::Overflow)?;
+        ema.slots[i].fast_frac_bps = new_fast;
+        ema.slots[i].slow_frac_bps = new_slow;
+    }
+    ema.last_updated_cohort = cohort_index;
+
+    // Per-slot demand markup adjustment based on this cohort's volume share.
+    for i in 0..NUM_STRIKES {
+        if cohort_strikes[i] == 0 {
+            continue;
+        }
+        let share = strike_share_bps(strike_volumes[i], total_vol);
+        ema.slots[i].demand_markup_bps =
+            adjust_strike_demand_markup(ema.slots[i].demand_markup_bps, share);
     }
 
-    // Legacy global markup (kept for layout compat, uses vault utilization)
-    let vault_total = ctx.accounts.vault.available_lamports
-        .checked_add(ctx.accounts.vault.active_collateral_lamports)
-        .unwrap_or(0);
-    let util_bps = utilization_bps(cohort.vault_collateral_locked, vault_total)
-        .unwrap_or(0);
-    ema.markup_bps = adjust_markup(ema.markup_bps, util_bps);
-
-    // Update global volume counter
-    ctx.accounts.global_state.total_volume_lamports = ctx
-        .accounts
-        .global_state
+    // Anchor + settlement-count update.
+    let new_anchor = update_strike_anchor(prev_anchor_bps, effective_mhi, prev_settlement_count)
+        .ok_or(MhiError::Overflow)?;
+    let gs = &mut ctx.accounts.global_state;
+    gs.strike_anchor_bps = new_anchor;
+    gs.strike_anchor_settlement_count = prev_settlement_count
+        .checked_add(1)
+        .ok_or(MhiError::Overflow)?;
+    gs.last_mhi_bps = effective_mhi;
+    gs.total_volume_lamports = gs
         .total_volume_lamports
-        .checked_add(cohort.total_call_volume_lamports)
-        .unwrap_or(ctx.accounts.global_state.total_volume_lamports); // saturate on overflow
-
-    // Track clamped MHI as reference for next cohort's clamp
-    ctx.accounts.global_state.last_mhi_bps = effective_mhi;
+        .checked_add(cohort_volume_for_global)
+        .unwrap_or(gs.total_volume_lamports);
 
     emit!(MhiSubmitted {
-        cohort_index: cohort.index,
+        cohort_index,
         mhi_bps: effective_mhi,
         token_count,
         cohort_hash,
+        new_strike_anchor_bps: new_anchor,
     });
 
     Ok(())

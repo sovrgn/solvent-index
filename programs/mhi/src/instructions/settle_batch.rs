@@ -37,9 +37,13 @@ pub struct SettleBatch<'info> {
 pub fn handler(ctx: Context<SettleBatch>) -> Result<()> {
     let clock = Clock::get()?;
 
-    // Read values we need before taking mutable references
+    // Read values we need before taking mutable references.
+    // cap_bps comes from the cohort snapshot (set at start_cohort), not the
+    // live global state — authority `update_config { mhi_cap_bps }` mid-flight
+    // must not change the cap used to release collateral or cap payouts for
+    // positions that locked against the at-start cap.
     let keeper = ctx.accounts.global_state.keeper;
-    let cap_bps = ctx.accounts.global_state.mhi_cap_bps;
+    let cap_bps = ctx.accounts.cohort.mhi_cap_bps_at_start;
     let claim_expiry = ctx.accounts.global_state.claim_expiry_seconds as i64;
     let cohort_key = ctx.accounts.cohort.key();
     let cohort_index = ctx.accounts.cohort.index;

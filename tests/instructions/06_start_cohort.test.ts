@@ -10,7 +10,9 @@ import {
   runFullCohort,
   voidCohort,
   findCohortPda,
+  deriveStrikes,
   TestCtx,
+  STRIKE_ANCHOR_DEFAULT_BPS,
   FAST_TRADING_WINDOW,
   FAST_MEASUREMENT,
   FAST_OBSERVATION,
@@ -32,12 +34,11 @@ describe("06 - start_cohort", () => {
       const [cohortPda] = findCohortPda(t.program.programId, idx);
 
       await t.program.methods
-        .startCohort()
+        .startCohort(deriveStrikes(STRIKE_ANCHOR_DEFAULT_BPS))
         .accounts({
           keeper: t.keeper.publicKey,
           globalState: t.globalState,
           vault: t.vault,
-          emaState: t.emaState,
           cohort: cohortPda,
           systemProgram: SystemProgram.programId,
         } as any)
@@ -52,16 +53,17 @@ describe("06 - start_cohort", () => {
       expect(cohort.mhiBps).to.equal(0);
     });
 
-    it("GlobalState → Active, total_cohorts increments", async () => {
+    it("active_cohorts and total_cohorts increment", async () => {
       const gs = await t.program.account.globalState.fetch(t.globalState);
-      expect(JSON.stringify(gs.currentCohortStatus)).to.include("active");
+      // ProtocolStatus enum was replaced by active_cohorts counter.
+      expect(gs.activeCohorts).to.equal(1);
       expect(gs.totalCohorts.toNumber()).to.equal(1);
     });
 
     it("deadlines correctly computed from clock + config", async () => {
       const gs = await t.program.account.globalState.fetch(t.globalState);
-      // currentCohortIndex stays at the active cohort's index until resolved.
-      const idx = gs.currentCohortIndex.toNumber();
+      // currentCohortIndex was incremented; the active cohort lives at idx-1.
+      const idx = gs.currentCohortIndex.toNumber() - 1;
       const [cohortPda] = findCohortPda(t.program.programId, idx);
       const cohort = await t.program.account.cohort.fetch(cohortPda);
 
@@ -91,26 +93,25 @@ describe("06 - start_cohort", () => {
     });
 
     it("start cohort immediately after previous settles - succeeds", async () => {
-      // Void the active cohort first to resolve it
+      // Resolve the active cohort first via void.
       const gsNow = await t.program.account.globalState.fetch(t.globalState);
-      const activeIdx = gsNow.currentCohortIndex.toNumber();
+      const activeIdx = gsNow.currentCohortIndex.toNumber() - 1;
       const [activeCohort] = findCohortPda(t.program.programId, activeIdx);
 
-      // Cohort 0 is active but empty. Void it to reach Idle.
+      // Cohort 0 is active but empty. Void it.
       await voidCohort(t, activeCohort);
 
       // Now run a full cohort (start → buy → warp → submit → settle → claim)
       await runFullCohort(t);
 
-      // Protocol should be idle now - start another cohort
+      // After settle, the cohort is resolved; active_cohorts should drop to 0.
       const gs2 = await t.program.account.globalState.fetch(t.globalState);
-      expect(JSON.stringify(gs2.currentCohortStatus)).to.include("idle");
+      expect(gs2.activeCohorts).to.equal(0);
 
       const nextIdx = gs2.currentCohortIndex.toNumber();
       const cohort = await startCohort(t);
       expect(cohort).to.not.be.null;
 
-      // Verify we can fetch the new cohort
       const cohortData = await t.program.account.cohort.fetch(cohort);
       expect(cohortData.index.toNumber()).to.equal(nextIdx);
       expect(JSON.stringify(cohortData.status)).to.include("trading");
@@ -130,12 +131,11 @@ describe("06 - start_cohort", () => {
       await expectError(
         () =>
           t.program.methods
-            .startCohort()
+            .startCohort(deriveStrikes(STRIKE_ANCHOR_DEFAULT_BPS))
             .accounts({
               keeper: t.randomUser.publicKey,
               globalState: t.globalState,
               vault: t.vault,
-              emaState: t.emaState,
               cohort: cohortPda,
               systemProgram: SystemProgram.programId,
             } as any)
@@ -167,7 +167,6 @@ describe("06 - start_cohort", () => {
           minPremiumLamports: null,
           maxPositionCollateralBps: null,
           paused: true,
-         
         } as any)
         .accounts({
           authority: t.authority.publicKey,
@@ -182,12 +181,11 @@ describe("06 - start_cohort", () => {
       await expectError(
         () =>
           t.program.methods
-            .startCohort()
+            .startCohort(deriveStrikes(STRIKE_ANCHOR_DEFAULT_BPS))
             .accounts({
               keeper: t.keeper.publicKey,
               globalState: t.globalState,
               vault: t.vault,
-              emaState: t.emaState,
               cohort: cohortPda,
               systemProgram: SystemProgram.programId,
             } as any)
@@ -217,7 +215,6 @@ describe("06 - start_cohort", () => {
           minPremiumLamports: null,
           maxPositionCollateralBps: null,
           paused: false,
-         
         } as any)
         .accounts({
           authority: t.authority.publicKey,
@@ -226,27 +223,28 @@ describe("06 - start_cohort", () => {
         .rpc();
     });
 
-    it("previous cohort not resolved → PreviousCohortNotResolved or already in use", async () => {
-      // Start a cohort so protocol is Active
-      const cohort = await startCohort(t);
+    it("active_cohorts at cap → PreviousCohortNotResolved or already in use", async () => {
+      // Start cohorts until we hit the MAX_ACTIVE_COHORTS = 3 cap.
+      const started: anchor.web3.PublicKey[] = [];
+      for (let i = 0; i < 3; i++) {
+        started.push(await startCohort(t));
+      }
 
-      // Warp for fresh blockhash (identical instruction otherwise)
+      // Warp for fresh blockhash
       await warpTime(t.context, 1);
-      // Try to start another - should fail
       const gs = await t.program.account.globalState.fetch(t.globalState);
       const idx = gs.currentCohortIndex.toNumber();
       const [nextCohortPda] = findCohortPda(t.program.programId, idx);
 
-      // Anchor's init constraint may fire before the handler's status check,
-      // so either PreviousCohortNotResolved or "already in use" is valid.
+      // 4th attempt should fail — either at the active_cohorts gate, or via
+      // Anchor's `init` constraint if the PDA happens to collide.
       try {
         await t.program.methods
-          .startCohort()
+          .startCohort(deriveStrikes(STRIKE_ANCHOR_DEFAULT_BPS))
           .accounts({
             keeper: t.keeper.publicKey,
             globalState: t.globalState,
             vault: t.vault,
-            emaState: t.emaState,
             cohort: nextCohortPda,
             systemProgram: SystemProgram.programId,
           } as any)
@@ -261,8 +259,10 @@ describe("06 - start_cohort", () => {
         if (!valid) throw err;
       }
 
-      // Clean up: void the active cohort
-      await voidCohort(t, cohort);
+      // Clean up: void all the active cohorts
+      for (const c of started) {
+        await voidCohort(t, c);
+      }
     });
   });
 });

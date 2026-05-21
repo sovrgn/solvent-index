@@ -4,9 +4,9 @@ import {
   setupProtocol, TestCtx, expectError,
   startCohort, buyCall, warpPastObservation, submitMhi, settleBatch,
   claimPosition, warpTime, getBalance, accountExists,
-  assertVaultConservation, SOL,
+  assertVaultConservation, currentLiveStrikes, currentAtmStrike,
   FAST_TRADING_WINDOW, FAST_MEASUREMENT, FAST_OBSERVATION,
-  FAST_SETTLEMENT_DEADLINE, FAST_CLAIM_EXPIRY,
+  FAST_SETTLEMENT_DEADLINE,
 } from "./_setup";
 
 describe("void_cohort", () => {
@@ -36,7 +36,8 @@ describe("void_cohort", () => {
   describe("happy path", () => {
     it("voids cohort after recovery - collateral released, positions refunded", async () => {
       const cohort = await startCohort(t);
-      const pos = await buyCall(t, cohort, { strikeBps: 12_000 });
+      const live = await currentLiveStrikes(t);
+      const pos = await buyCall(t, cohort, { strikeBps: live[2] });
 
       const posBefore = await t.program.account.position.fetch(pos);
       const vaultPremium = posBefore.vaultPremiumLamports.toNumber();
@@ -72,8 +73,9 @@ describe("void_cohort", () => {
 
     it("void with referral position - refund is vault_premium (not full premium)", async () => {
       const cohort = await startCohort(t);
+      const live = await currentLiveStrikes(t);
       const pos = await buyCall(t, cohort, {
-        strikeBps: 12_000,
+        strikeBps: live[2],
         referrer: t.randomUser.publicKey,
       });
 
@@ -81,13 +83,16 @@ describe("void_cohort", () => {
       expect(posData.vaultPremiumLamports.toNumber()).to.be.lessThan(
         posData.premiumPaidLamports.toNumber(),
       );
-      const vaultPremium = posData.vaultPremiumLamports.toNumber();
+      const premiumPaid = posData.premiumPaidLamports.toNumber();
 
       await warpTime(t.context, RECOVERY_WAIT);
       await doVoid(cohort, [pos]);
 
+      // void_cohort refunds the FULL premium the buyer paid (the protocol
+      // eats the referral that was already paid out — it's the cost of an
+      // emergency recovery). See void_cohort.rs.
       const posAfter = await t.program.account.position.fetch(pos);
-      expect(posAfter.payoutLamports.toNumber()).to.equal(vaultPremium);
+      expect(posAfter.payoutLamports.toNumber()).to.equal(premiumPaid);
 
       await claimPosition(t, cohort, pos, t.buyer);
       await assertVaultConservation(t);
@@ -121,7 +126,7 @@ describe("void_cohort", () => {
     it("MHI already submitted → MhiAlreadySubmitted", async () => {
       const cohort = await startCohort(t);
       await warpPastObservation(t.context);
-      await submitMhi(t, cohort, 12_000);
+      await submitMhi(t, cohort, await currentAtmStrike(t));
       await warpTime(t.context, FAST_SETTLEMENT_DEADLINE * 2 + 3);
 
       await expectError(

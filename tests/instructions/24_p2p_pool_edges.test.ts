@@ -66,9 +66,16 @@ async function setupP2pProtocol(seedSol = 5, poolDeposit = 5): Promise<{
 }
 
 async function fillVaultAndBuyP2p(
-  t: TestCtx, pool: PublicKey, buyer: Keypair, strike = 12_000, size = SOL(0.05),
+  t: TestCtx, pool: PublicKey, buyer: Keypair, strikeArg?: number, size = SOL(0.05),
 ): Promise<{ cohort: PublicKey; vaultPositions: PublicKey[]; p2pPosition: PublicKey }> {
   const cohort = await startCohort(t);
+  // Strike defaults to the current cohort's ATM — anchor moves between
+  // cohorts so the cold-start literal goes stale.
+  let strike = strikeArg;
+  if (strike === undefined) {
+    const c = await t.program.account.cohort.fetch(cohort);
+    strike = ((c as any).strikes as number[])[2]!;
+  }
   const vaultPositions: PublicKey[] = [];
   for (let i = 0; i < 50; i++) {
     try {
@@ -160,9 +167,11 @@ describe("24 - P2P pool edge cases", () => {
       for (const pos of vaultPositions) {
         try { await claimPosition(t, cohort, pos, t.buyer); } catch {}
       }
-      await t.program.methods.closeCohort()
-        .accounts({ caller: t.keeper.publicKey, globalState: t.globalState, cohort } as any)
-        .signers([t.keeper]).rpc();
+      // Don't close the cohort here — the unclaimed P2P payout (the whole
+      // point of this test) keeps `outstanding_p2p_positions > 0`, which
+      // would block close_cohort's is_quiescent() gate. The cohort is
+      // already Settled so withdraw_p2p (which requires active_cohorts==0)
+      // can proceed without closing the PDA.
 
       // Now try full withdrawal - might fail if unclaimed_payouts reserved
       try {
@@ -201,24 +210,25 @@ describe("24 - P2P pool edge cases", () => {
   // 4. Multiple settlement batches
   describe("batched P2P settlement", () => {
     it("settling in two batches correctly tracks active_collateral", async () => {
-      const { t, pool, writer, writerAccount, buyer } = await setupP2pProtocol(5, 10);
+      const { t, pool, buyer } = await setupP2pProtocol(5, 10);
 
       const cohort = await startCohort(t);
+      const atm = ((await t.program.account.cohort.fetch(cohort)) as any).strikes[2];
       // Fill vault
       const vaultPositions: PublicKey[] = [];
       for (let i = 0; i < 50; i++) {
-        try { vaultPositions.push(await buyCall(t, cohort, { strikeBps: 12_000, size: SOL(0.05), nonce: i, buyer: t.buyer })); }
+        try { vaultPositions.push(await buyCall(t, cohort, { strikeBps: atm, size: SOL(0.05), nonce: i, buyer: t.buyer })); }
         catch { break; }
       }
       // Two P2P positions
       const buyer2 = await fundedKeypair(t.context, 100);
-      const [p2p1] = findP2pPositionPda(t.program.programId, cohort, buyer.publicKey, 12_000, 0);
-      const [p2p2] = findP2pPositionPda(t.program.programId, cohort, buyer2.publicKey, 12_000, 0);
+      const [p2p1] = findP2pPositionPda(t.program.programId, cohort, buyer.publicKey, atm, 0);
+      const [p2p2] = findP2pPositionPda(t.program.programId, cohort, buyer2.publicKey, atm, 0);
 
-      await (t.program.methods as any).buyCallP2P(12_000, SOL(0.05), 0)
+      await (t.program.methods as any).buyCallP2P(atm, SOL(0.05), 0)
         .accounts({ buyer: buyer.publicKey, globalState: t.globalState, vault: t.vault, p2PPool: pool, cohort, emaState: t.emaState, p2PPosition: p2p1, systemProgram: SystemProgram.programId } as any)
         .signers([buyer]).rpc();
-      await (t.program.methods as any).buyCallP2P(12_000, SOL(0.05), 0)
+      await (t.program.methods as any).buyCallP2P(atm, SOL(0.05), 0)
         .accounts({ buyer: buyer2.publicKey, globalState: t.globalState, vault: t.vault, p2PPool: pool, cohort, emaState: t.emaState, p2PPosition: p2p2, systemProgram: SystemProgram.programId } as any)
         .signers([buyer2]).rpc();
 
@@ -249,22 +259,23 @@ describe("24 - P2P pool edge cases", () => {
   // 5. Expire after partial claim
   describe("expire after partial claim", () => {
     it("one position claimed, another expired - pool accounting correct", async () => {
-      const { t, pool, writer, writerAccount, buyer } = await setupP2pProtocol(5, 10);
+      const { t, pool, buyer } = await setupP2pProtocol(5, 10);
       const buyer2 = await fundedKeypair(t.context, 100);
 
       const cohort = await startCohort(t);
+      const atm = ((await t.program.account.cohort.fetch(cohort)) as any).strikes[2];
       const vaultPositions: PublicKey[] = [];
       for (let i = 0; i < 50; i++) {
-        try { vaultPositions.push(await buyCall(t, cohort, { strikeBps: 12_000, size: SOL(0.05), nonce: i, buyer: t.buyer })); }
+        try { vaultPositions.push(await buyCall(t, cohort, { strikeBps: atm, size: SOL(0.05), nonce: i, buyer: t.buyer })); }
         catch { break; }
       }
 
-      const [p2p1] = findP2pPositionPda(t.program.programId, cohort, buyer.publicKey, 12_000, 0);
-      const [p2p2] = findP2pPositionPda(t.program.programId, cohort, buyer2.publicKey, 12_000, 0);
-      await (t.program.methods as any).buyCallP2P(12_000, SOL(0.05), 0)
+      const [p2p1] = findP2pPositionPda(t.program.programId, cohort, buyer.publicKey, atm, 0);
+      const [p2p2] = findP2pPositionPda(t.program.programId, cohort, buyer2.publicKey, atm, 0);
+      await (t.program.methods as any).buyCallP2P(atm, SOL(0.05), 0)
         .accounts({ buyer: buyer.publicKey, globalState: t.globalState, vault: t.vault, p2PPool: pool, cohort, emaState: t.emaState, p2PPosition: p2p1, systemProgram: SystemProgram.programId } as any)
         .signers([buyer]).rpc();
-      await (t.program.methods as any).buyCallP2P(12_000, SOL(0.05), 0)
+      await (t.program.methods as any).buyCallP2P(atm, SOL(0.05), 0)
         .accounts({ buyer: buyer2.publicKey, globalState: t.globalState, vault: t.vault, p2PPool: pool, cohort, emaState: t.emaState, p2PPosition: p2p2, systemProgram: SystemProgram.programId } as any)
         .signers([buyer2]).rpc();
 
@@ -298,21 +309,24 @@ describe("24 - P2P pool edge cases", () => {
     });
   });
 
-  // 6. Withdrawal attempt during active cohort
+  // 6. Withdrawal allowed during active cohort if pool has free capital
   describe("withdrawal during active cohort", () => {
-    it("rejects withdrawal when cohort is active", async () => {
+    it("withdrawal succeeds when pool has free capital (no active-cohort gate)", async () => {
+      // withdraw_p2p.rs only gates on pool.available_lamports — it does NOT
+      // check active_cohorts. Writers can pull their share of free capital
+      // any time; only collateral that's actively locked against a P2P
+      // position is unwithdrawable.
       const { t, pool, writer, writerAccount } = await setupP2pProtocol(5, 5);
       const cohort = await startCohort(t);
 
       const wa = await (t.program.account as any).writerAccount.fetch(writerAccount);
-      await expectError(
-        () => (t.program.methods as any).withdrawP2P(new anchor.BN(wa.shares.toNumber()))
-          .accounts({ writer: writer.publicKey, globalState: t.globalState, p2PPool: pool, writerAccount, systemProgram: SystemProgram.programId } as any)
-          .signers([writer]).rpc(),
-        "InvalidCohortStatus"
-      );
+      await (t.program.methods as any).withdrawP2P(new anchor.BN(wa.shares.toNumber()))
+        .accounts({ writer: writer.publicKey, globalState: t.globalState, p2PPool: pool, writerAccount, systemProgram: SystemProgram.programId } as any)
+        .signers([writer]).rpc();
 
-      // Cleanup
+      const poolAfter = await (t.program.account as any).p2PPool.fetch(pool);
+      expect(poolAfter.totalShares.toNumber()).to.equal(0);
+
       await warpTime(t.context, FULL_WARP);
       await submitMhi(t, cohort, 14_000);
       await settleBatch(t, cohort, []);

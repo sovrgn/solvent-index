@@ -3,11 +3,10 @@ import { SystemProgram } from "@solana/web3.js";
 import {
   setupProtocol, TestCtx, expectError,
   startCohort, buyCall, warpPastObservation, submitMhi, settleBatch,
-  claimPosition, warpTime, warpToTimestamp, assertVaultConservation,
-  voidCohort, runFullCohort, SOL, getBalance, accountExists,
-  fundedKeypair, findPositionPda,
-  FAST_TRADING_WINDOW, FAST_MEASUREMENT, FAST_OBSERVATION,
-  FAST_SETTLEMENT_DEADLINE, FAST_CLAIM_EXPIRY,
+  claimPosition, warpTime, warpToTimestamp,
+  getBalance, accountExists,
+  currentAtmStrike, currentLiveStrikes,
+  FAST_OBSERVATION, FAST_CLAIM_EXPIRY,
 } from "./_setup";
 
 describe("16 - timing boundaries", () => {
@@ -30,7 +29,6 @@ describe("16 - timing boundaries", () => {
         "ObservationNotComplete",
       );
 
-      // cleanup: warp past and submit so cohort can be settled
       await warpToTimestamp(t.context, observationEnd);
       await submitMhi(t, cohort, 14_000);
       await settleBatch(t, cohort, []);
@@ -47,7 +45,6 @@ describe("16 - timing boundaries", () => {
       const data = await t.program.account.cohort.fetch(cohort);
       expect(data.mhiBps).to.be.greaterThan(0);
 
-      // cleanup
       await settleBatch(t, cohort, []);
     });
   });
@@ -60,7 +57,8 @@ describe("16 - timing boundaries", () => {
 
     it("non-keeper at settlement_deadline - 1 → SettlementDeadlineNotReached", async () => {
       const cohort = await startCohort(t);
-      const pos = await buyCall(t, cohort, { strikeBps: 12_000 });
+      const live = await currentLiveStrikes(t);
+      const pos = await buyCall(t, cohort, { strikeBps: live[2] });
 
       await warpPastObservation(t.context);
       await submitMhi(t, cohort, 14_000);
@@ -75,7 +73,6 @@ describe("16 - timing boundaries", () => {
         "SettlementDeadlineNotReached",
       );
 
-      // cleanup: keeper settles
       await settleBatch(t, cohort, [pos], t.keeper);
       await claimPosition(t, cohort, pos, t.buyer);
     });
@@ -89,10 +86,11 @@ describe("16 - timing boundaries", () => {
 
     it("claim at claim_deadline - 1 → succeeds", async () => {
       const cohort = await startCohort(t);
-      const pos = await buyCall(t, cohort, { strikeBps: 12_000 });
+      const live = await currentLiveStrikes(t);
+      const pos = await buyCall(t, cohort, { strikeBps: live[2] });
 
       await warpPastObservation(t.context);
-      await submitMhi(t, cohort, 15_000); // ITM
+      await submitMhi(t, cohort, live[5]!); // ITM
       await settleBatch(t, cohort, [pos]);
 
       const posData = await t.program.account.position.fetch(pos);
@@ -129,10 +127,11 @@ describe("16 - timing boundaries", () => {
 
     it("expire_position at claim_deadline - 1 → ClaimNotExpired", async () => {
       const cohort = await startCohort(t);
-      const pos = await buyCall(t, cohort, { strikeBps: 12_000 });
+      const live = await currentLiveStrikes(t);
+      const pos = await buyCall(t, cohort, { strikeBps: live[2] });
 
       await warpPastObservation(t.context);
-      await submitMhi(t, cohort, 15_000); // ITM
+      await submitMhi(t, cohort, live[5]!);
       await settleBatch(t, cohort, [pos]);
 
       const posData = await t.program.account.position.fetch(pos);
@@ -145,16 +144,16 @@ describe("16 - timing boundaries", () => {
         "ClaimNotExpired",
       );
 
-      // cleanup: claim the position
       await claimPosition(t, cohort, pos, t.buyer);
     });
 
     it("expire_position at claim_deadline → ClaimNotExpired", async () => {
       const cohort = await startCohort(t);
-      const pos = await buyCall(t, cohort, { strikeBps: 12_000 });
+      const live = await currentLiveStrikes(t);
+      const pos = await buyCall(t, cohort, { strikeBps: live[2] });
 
       await warpPastObservation(t.context);
-      await submitMhi(t, cohort, 15_000); // ITM
+      await submitMhi(t, cohort, live[5]!);
       await settleBatch(t, cohort, [pos]);
 
       const posData = await t.program.account.position.fetch(pos);
@@ -167,17 +166,17 @@ describe("16 - timing boundaries", () => {
         "ClaimNotExpired",
       );
 
-      // cleanup: warp past deadline and expire (claim window already closed at deadline)
       await warpTime(t.context, 1);
       await expirePosition(cohort, pos);
     });
 
     it("expire_position at claim_deadline + 1 → succeeds", async () => {
       const cohort = await startCohort(t);
-      const pos = await buyCall(t, cohort, { strikeBps: 12_000 });
+      const live = await currentLiveStrikes(t);
+      const pos = await buyCall(t, cohort, { strikeBps: live[2] });
 
       await warpPastObservation(t.context);
-      await submitMhi(t, cohort, 15_000); // ITM
+      await submitMhi(t, cohort, live[5]!);
       await settleBatch(t, cohort, [pos]);
 
       const posData = await t.program.account.position.fetch(pos);
@@ -219,7 +218,7 @@ describe("16 - timing boundaries", () => {
   });
 
 
-  describe("close_cohort boundary at settlement_deadline + claim_expiry", () => {
+  describe("close_cohort boundary at settlement_deadline (cohort.is_quiescent)", () => {
     let t: TestCtx;
 
     before(async () => { t = await setupProtocol(); });
@@ -230,20 +229,24 @@ describe("16 - timing boundaries", () => {
         .accounts({
           caller: caller.publicKey,
           globalState: t.globalState,
+          authority: t.authority.publicKey,
           cohort,
         } as any)
         .signers([caller])
         .rpc();
     }
 
-    it("close_cohort at (settlement_deadline + claim_expiry) - 1 → ClaimNotExpired", async () => {
+    it("close_cohort at settlement_deadline - 1 → ClaimNotExpired", async () => {
       const cohort = await startCohort(t);
       await warpPastObservation(t.context);
-      await submitMhi(t, cohort, 12_000);
+      await submitMhi(t, cohort, await currentAtmStrike(t));
       await settleBatch(t, cohort, []);
 
       const cohortData = await t.program.account.cohort.fetch(cohort);
-      const closeThreshold = cohortData.settlementDeadline.toNumber() + FAST_CLAIM_EXPIRY;
+      // close_cohort gate (close_cohort.rs): `now >= settlement_deadline`.
+      // With zero positions the cohort is already quiescent, so the
+      // settlement_deadline floor is the only effective threshold.
+      const closeThreshold = cohortData.settlementDeadline.toNumber();
 
       await warpToTimestamp(t.context, closeThreshold - 1);
 
@@ -252,19 +255,21 @@ describe("16 - timing boundaries", () => {
         "ClaimNotExpired",
       );
 
-      // cleanup: warp past and close
       await warpToTimestamp(t.context, closeThreshold);
       await closeCohort(cohort);
     });
 
-    it("close_cohort at (settlement_deadline + claim_expiry) → succeeds", async () => {
+    it("close_cohort at settlement_deadline → succeeds", async () => {
       const cohort = await startCohort(t);
       await warpPastObservation(t.context);
-      await submitMhi(t, cohort, 12_000);
+      await submitMhi(t, cohort, await currentAtmStrike(t));
       await settleBatch(t, cohort, []);
 
       const cohortData = await t.program.account.cohort.fetch(cohort);
-      const closeThreshold = cohortData.settlementDeadline.toNumber() + FAST_CLAIM_EXPIRY;
+      // close_cohort gate (close_cohort.rs): `now >= settlement_deadline`.
+      // With zero positions the cohort is already quiescent, so the
+      // settlement_deadline floor is the only effective threshold.
+      const closeThreshold = cohortData.settlementDeadline.toNumber();
 
       await warpToTimestamp(t.context, closeThreshold);
 
