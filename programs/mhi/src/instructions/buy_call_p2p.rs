@@ -3,7 +3,7 @@ use anchor_lang::system_program;
 
 use crate::constants::{
     COHORT_SEED, EMA_BASE_MARKUP_BPS, EMA_STATE_SEED, GLOBAL_STATE_SEED, MIN_PREMIUM_BPS_FLOOR,
-    P2P_POOL_SEED, P2P_POSITION_SEED, VAULT_SEED,
+    P2P_POOL_SEED, P2P_POSITION_SEED, VAULT_SEED, VAULT_TO_P2P_RATIO,
 };
 use crate::errors::MhiError;
 use crate::math::bps::mul_bps_u16;
@@ -111,6 +111,11 @@ pub fn handler(
         mhi_cap_bps, strike_bps, size_lamports,
     ).ok_or(MhiError::Overflow)?;
 
+    // Routing gate: a P2P buy is allowed when EITHER
+    //   (a) the vault cannot serve this position (full / over cap), OR
+    //   (b) the 80/20 ratio rule says this position should go to P2P
+    //       (vault_positions >= (p2p_positions + 1) * VAULT_TO_P2P_RATIO).
+    // Otherwise reject with VaultNotFull — the client should call buy_call.
     {
         let vault_can_serve = if gs.max_vault_risk_per_cohort_bps > 0 {
             let vault_total = ctx.accounts.vault.available_lamports
@@ -123,13 +128,37 @@ pub fn handler(
         } else {
             ctx.accounts.vault.available_lamports >= collateral
         };
-        require!(!vault_can_serve, MhiError::VaultNotFull);
+
+        let next_p2p = ctx.accounts.cohort.p2p_positions
+            .checked_add(1)
+            .ok_or(MhiError::Overflow)?;
+        let ratio_threshold = (next_p2p as u64)
+            .checked_mul(VAULT_TO_P2P_RATIO as u64)
+            .ok_or(MhiError::Overflow)?;
+        let ratio_wants_p2p = (ctx.accounts.cohort.total_positions as u64) >= ratio_threshold;
+
+        require!(!vault_can_serve || ratio_wants_p2p, MhiError::VaultNotFull);
     }
 
     require!(
         ctx.accounts.p2p_pool.available_lamports >= collateral,
         MhiError::InsufficientWriterCollateral
     );
+
+    // Enforce the same per-cohort risk cap on the P2P pool as on the vault.
+    // Base is the pool's own (available + active_collateral) so a small pool
+    // can't be flooded with collateral that exceeds its size.
+    if gs.max_vault_risk_per_cohort_bps > 0 {
+        let pool_total = ctx.accounts.p2p_pool.available_lamports
+            .checked_add(ctx.accounts.p2p_pool.active_collateral_lamports)
+            .ok_or(MhiError::Overflow)?;
+        let p2p_max_cohort = mul_bps_u16(pool_total, gs.max_vault_risk_per_cohort_bps)
+            .ok_or(MhiError::Overflow)?;
+        let p2p_new_locked = ctx.accounts.cohort.p2p_collateral_locked
+            .checked_add(collateral)
+            .ok_or(MhiError::Overflow)?;
+        require!(p2p_new_locked <= p2p_max_cohort, MhiError::P2pRiskCapExceeded);
+    }
 
     let ema = &ctx.accounts.ema_state;
     let slot = &ema.slots[strike_idx];

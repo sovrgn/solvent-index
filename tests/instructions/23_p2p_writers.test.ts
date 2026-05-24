@@ -37,10 +37,8 @@ describe("23 - P2P writers", () => {
     });
 
     it("buy_call_p2p rejects when p2p_enabled is false", async () => {
-      // Init pool but DON'T enable P2P
+      // P2P pool already initialized by setupProtocol; P2P stays disabled by default.
       const [poolPda] = PublicKey.findProgramAddressSync([Buffer.from("p2p_pool")], t.program.programId);
-      await (t.program.methods as any).initP2PPool()
-        .accounts({ authority: t.authority.publicKey, globalState: t.globalState, p2PPool: poolPda, systemProgram: SystemProgram.programId } as any).rpc();
 
       const cohort = await startCohort(t);
       const atm = await currentAtmStrike(t);
@@ -150,10 +148,8 @@ describe("23 - P2P writers", () => {
     });
 
     it("buy_call_p2p rejects when vault can still serve the position", async () => {
-      // Init pool and enable P2P
+      // P2P pool already initialized by setupProtocol; enable P2P.
       const [poolPda] = PublicKey.findProgramAddressSync([Buffer.from("p2p_pool")], t.program.programId);
-      await (t.program.methods as any).initP2PPool()
-        .accounts({ authority: t.authority.publicKey, globalState: t.globalState, p2PPool: poolPda, systemProgram: SystemProgram.programId } as any).rpc();
       await enableP2p(t, poolPda);
 
       // Deposit into pool
@@ -203,18 +199,10 @@ describe("23 - P2P writers", () => {
       t = await setupProtocol({ seedSol: 5 });
       writer = await fundedKeypair(t.context, 100);
       buyer3 = await fundedKeypair(t.context, 100);
-      // Initialize P2P pool first (needed for enableP2p)
+      // P2P pool already initialized by setupProtocol; enable P2P.
       [p2pPoolPda] = PublicKey.findProgramAddressSync(
         [Buffer.from("p2p_pool")], t.program.programId,
       );
-      await (t.program.methods as any).initP2PPool()
-        .accounts({
-          authority: t.authority.publicKey,
-          globalState: t.globalState,
-          p2PPool: p2pPoolPda,
-          systemProgram: SystemProgram.programId,
-        } as any)
-        .rpc();
 
       await enableP2p(t, p2pPoolPda);
 

@@ -7,6 +7,7 @@ const EMA_STATE_SEED = Buffer.from("ema_state");
 const COHORT_SEED = Buffer.from("cohort");
 const POSITION_SEED = Buffer.from("position");
 const P2P_POSITION_SEED = Buffer.from("p2p_position");
+const P2P_POOL_SEED = Buffer.from("p2p_pool");
 
 export function findGlobalStatePda(programId: PublicKey): [PublicKey, number] {
   return PublicKey.findProgramAddressSync([GLOBAL_STATE_SEED], programId);
@@ -52,6 +53,10 @@ export function findPositionPda(
     ],
     programId
   );
+}
+
+export function findP2pPoolPda(programId: PublicKey): [PublicKey, number] {
+  return PublicKey.findProgramAddressSync([P2P_POOL_SEED], programId);
 }
 
 export function findP2pPositionPda(

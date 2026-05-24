@@ -2,7 +2,7 @@
  * Vault risk cap enforcement tests.
  *
  * DESIGN_MHI.md specifies:
- * - max_vault_risk_per_cohort_bps (default 1500 = 15%) limits total collateral
+ * - max_vault_risk_per_cohort_bps (default 2000 = 20%) limits total collateral
  *   locked in a single cohort to a fraction of total vault capacity.
  * - This is the V1 defense against capacity spam / whale monopolization.
  *   (Per-address cap is deferred to V2 per design doc.)
@@ -29,11 +29,11 @@ describe("vault risk cap enforcement", () => {
     let t: TestCtx;
 
     before(async () => {
-      // Seed with 10 SOL, risk cap at 15% → max cohort collateral = ~1.5 SOL
+      // Seed with 10 SOL, risk cap at 20% → max cohort collateral = ~2 SOL
       t = await setupProtocol({ seedSol: 10 });
-      // Ensure max_vault_risk_per_cohort_bps is 1500 (default)
+      // Ensure max_vault_risk_per_cohort_bps is 2000 (default)
       const gs = await t.program.account.globalState.fetch(t.globalState);
-      expect(gs.maxVaultRiskPerCohortBps).to.equal(1500);
+      expect(gs.maxVaultRiskPerCohortBps).to.equal(2000);
     });
 
     it("buy exceeding per-cohort risk cap → InsufficientVaultCollateral", async () => {
@@ -51,6 +51,7 @@ describe("vault risk cap enforcement", () => {
             buyer: t.buyer.publicKey,
             globalState: t.globalState,
             vault: t.vault,
+            p2pPool: t.p2pPool,
             cohort,
             emaState: t.emaState,
             position: posPda,
@@ -118,6 +119,7 @@ describe("vault risk cap enforcement", () => {
             buyer: t.buyer.publicKey,
             globalState: t.globalState,
             vault: t.vault,
+            p2pPool: t.p2pPool,
             cohort,
             emaState: t.emaState,
             position: posPda3,
@@ -133,7 +135,7 @@ describe("vault risk cap enforcement", () => {
       const vault = await t.program.account.vault.fetch(t.vault);
       const vaultTotal = vault.availableLamports.toNumber() +
         vault.activeCollateralLamports.toNumber();
-      const maxCohortCollateral = Math.floor(vaultTotal * 1500 / 10000);
+      const maxCohortCollateral = Math.floor(vaultTotal * 2000 / 10000);
 
       // Locked should be < cap (2 positions went through)
       expect(cohortData.vaultCollateralLocked.toNumber()).to.be.lessThanOrEqual(
@@ -173,7 +175,7 @@ describe("vault risk cap enforcement", () => {
       const cohort = await startCohort(t);
       const live = await currentLiveStrikes(t);
 
-      // SOL(2) at the lowest strike would breach the 15% cap on a 10 SOL vault.
+      // SOL(2.5) at the lowest strike would breach the 20% cap on a 10 SOL vault.
       const pos = await buyCall(t, cohort, {
         strikeBps: live[0],
         size: SOL(2),
@@ -229,6 +231,7 @@ describe("vault risk cap enforcement", () => {
             buyer: sybil3.publicKey,
             globalState: t.globalState,
             vault: t.vault,
+            p2pPool: t.p2pPool,
             cohort,
             emaState: t.emaState,
             position: posPda3,

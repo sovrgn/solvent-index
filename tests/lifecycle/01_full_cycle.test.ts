@@ -9,6 +9,7 @@ import {
   findEmaStatePda,
   findCohortPda,
   findPositionPda,
+  findP2pPoolPda,
 } from "../helpers/accounts";
 import { getBankrunContext, warpTime, createFundedKeypair, fundAccount, getAccountOrNull } from "../helpers/context";
 import {
@@ -39,6 +40,7 @@ describe("mhi protocol", () => {
   let globalStatePda: PublicKey;
   let vaultPda: PublicKey;
   let emaStatePda: PublicKey;
+  let p2pPoolPda: PublicKey;
 
   // Cold-start strike ladder is what the chain accepts for cohort 0.
   const coldStrikes = deriveStrikes(STRIKE_ANCHOR_DEFAULT_BPS);
@@ -54,6 +56,7 @@ describe("mhi protocol", () => {
     [globalStatePda] = findGlobalStatePda(program.programId);
     [vaultPda] = findVaultPda(program.programId);
     [emaStatePda] = findEmaStatePda(program.programId);
+    [p2pPoolPda] = findP2pPoolPda(program.programId);
 
     await fundAccount(context, keeper.publicKey);
     buyer = await createFundedKeypair(context);
@@ -154,6 +157,17 @@ describe("mhi protocol", () => {
 
       const vault = await program.account.vault.fetch(vaultPda);
       expect(vault.availableLamports.toNumber()).to.equal(SOL(5).toNumber());
+
+      // Init the P2P pool now so buy_call (which requires it as an account)
+      // can find the PDA on later tests.
+      await (program.methods as any).initP2PPool()
+        .accounts({
+          authority: authority.publicKey,
+          globalState: globalStatePda,
+          p2PPool: p2pPoolPda,
+          systemProgram: SystemProgram.programId,
+        } as any)
+        .rpc();
     });
 
     it("fails with amount = 0", async () => {
@@ -290,6 +304,7 @@ describe("mhi protocol", () => {
           buyer: buyer.publicKey,
           globalState: globalStatePda,
           vault: vaultPda,
+          p2pPool: p2pPoolPda,
           cohort: cohortPda,
           emaState: emaStatePda,
           position: positionPda,
@@ -328,6 +343,7 @@ describe("mhi protocol", () => {
             buyer: buyer.publicKey,
             globalState: globalStatePda,
             vault: vaultPda,
+            p2pPool: p2pPoolPda,
             cohort: cohortPda,
             emaState: emaStatePda,
             position: badPosPda,
@@ -352,6 +368,7 @@ describe("mhi protocol", () => {
             buyer: buyer.publicKey,
             globalState: globalStatePda,
             vault: vaultPda,
+            p2pPool: p2pPoolPda,
             cohort: cohortPda,
             emaState: emaStatePda,
             position: zeroPosPda,

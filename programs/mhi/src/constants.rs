@@ -87,7 +87,13 @@ pub const STRIKE_SHARE_HIGH_BPS: u16 = 5_000;    // >50% of volume = high demand
 pub const STRIKE_SHARE_LOW_BPS: u16 = 1_000;     // <10% of volume = low demand
 
 pub const DEFAULT_MAX_POSITION_PER_ADDRESS_BPS: u16 = 2_000; // 20%
-pub const DEFAULT_MAX_VAULT_RISK_PER_COHORT_BPS: u16 = 1_500; // 15%
+/// Per-cohort risk cap (BPS of pool total). Applied identically to vault and P2P pool.
+/// 2_000 = 20%: in the worst case where every position pays max payoff, only this
+/// fraction of each pool is at risk for one cohort.
+pub const DEFAULT_MAX_VAULT_RISK_PER_COHORT_BPS: u16 = 2_000; // 20%
+/// Vault-to-P2P position ratio: for every N vault positions, 1 goes to P2P.
+/// 4 = 80/20 split. Rule: route to P2P when `vault_positions >= (p2p_positions + 1) * VAULT_TO_P2P_RATIO`.
+pub const VAULT_TO_P2P_RATIO: u32 = 4;
 pub const DEFAULT_MAX_POSITION_COLLATERAL_BPS: u16 = 500; // 5% of cohort cap (0.75% of vault)
 pub const DEFAULT_MANAGEMENT_FEE_BPS: u16 = 1_500; // 15%
 pub const DEFAULT_P2P_BUYER_FEE_BPS: u16 = 500;   // 5%

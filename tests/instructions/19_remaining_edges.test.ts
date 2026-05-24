@@ -55,6 +55,17 @@ describe("19 - remaining edge cases", () => {
           systemProgram: SystemProgram.programId,
         } as any)
         .rpc();
+
+      // P2P pool init is normally done in setupProtocol; this test uses
+      // skipInit so we need to do it manually for buy_call to find the PDA.
+      await (t.program.methods as any).initP2PPool()
+        .accounts({
+          authority: t.authority.publicKey,
+          globalState: t.globalState,
+          p2PPool: t.p2pPool,
+          systemProgram: SystemProgram.programId,
+        } as any)
+        .rpc();
     });
 
     it("initialize with empty EMA + MIN_PREMIUM_BPS_FLOOR keeps buy_call solvent at cold start", async () => {

@@ -3,16 +3,17 @@ use anchor_lang::system_program;
 
 use crate::constants::{
     COHORT_SEED, EMA_BASE_MARKUP_BPS, EMA_STATE_SEED, GLOBAL_STATE_SEED, MIN_PREMIUM_BPS_FLOOR,
-    POSITION_SEED, VAULT_SEED,
+    P2P_POOL_SEED, POSITION_SEED, VAULT_SEED, VAULT_TO_P2P_RATIO,
 };
 use crate::errors::MhiError;
 use crate::events::CallPurchased;
+use crate::math::bps::mul_bps_u16;
 use crate::math::ema::{cold_start_markup, fair_payoff_bps};
 use crate::math::payoff::total_collateral_lamports_ceil;
 use crate::math::premium::{
     charged_premium_bps, premium_lamports, referral_split, volume_fee_lamports,
 };
-use crate::state::{Cohort, EmaState, GlobalState, Position, Vault};
+use crate::state::{Cohort, EmaState, GlobalState, P2pPool, Position, Vault};
 
 #[derive(Accounts)]
 #[instruction(strike_bps: u32, size_lamports: u64, nonce: u8)]
@@ -33,6 +34,15 @@ pub struct BuyCall<'info> {
         bump = vault.bump,
     )]
     pub vault: Account<'info, Vault>,
+
+    /// P2P pool — read-only here; used to decide whether the 80/20 routing
+    /// rule wants this position to go to P2P instead. Always included so the
+    /// program can enforce routing on-chain without trusting the client.
+    #[account(
+        seeds = [P2P_POOL_SEED],
+        bump = p2p_pool.bump,
+    )]
+    pub p2p_pool: Account<'info, P2pPool>,
 
     #[account(
         mut,
@@ -159,7 +169,7 @@ pub fn handler<'info>(
         let vault_total = ctx.accounts.vault.available_lamports
             .checked_add(ctx.accounts.vault.active_collateral_lamports)
             .ok_or(MhiError::Overflow)?;
-        let max_cohort_collateral = crate::math::bps::mul_bps_u16(vault_total, max_risk_per_cohort_bps)
+        let max_cohort_collateral = mul_bps_u16(vault_total, max_risk_per_cohort_bps)
             .ok_or(MhiError::Overflow)?;
         let new_cohort_locked = ctx.accounts.cohort.vault_collateral_locked
             .checked_add(collateral)
@@ -175,12 +185,46 @@ pub fn handler<'info>(
         // whales more for taking large capacity.
         let max_pos_collateral_bps = gs.max_position_collateral_bps;
         if max_pos_collateral_bps > 0 {
-            let max_pos_collateral = crate::math::bps::mul_bps_u16(max_cohort_collateral, max_pos_collateral_bps)
+            let max_pos_collateral = mul_bps_u16(max_cohort_collateral, max_pos_collateral_bps)
                 .ok_or(MhiError::Overflow)?;
             require!(
                 collateral <= max_pos_collateral,
                 MhiError::PositionTooLarge
             );
+        }
+    }
+
+    // 80/20 vault/P2P routing. Reject this vault buy and force the client to
+    // use buy_call_p2p when:
+    //   1. P2P is enabled, AND
+    //   2. The ratio rule says this position should go P2P
+    //      (vault_positions >= (p2p_positions + 1) * VAULT_TO_P2P_RATIO), AND
+    //   3. The P2P pool can actually serve it (has free collateral AND its own
+    //      per-cohort risk cap, using the same bps, isn't exceeded).
+    // If P2P cannot serve, we let the vault take the position even when the
+    // ratio prefers P2P — overflow vault → P2P is symmetric in buy_call_p2p.
+    if gs.p2p_enabled && max_risk_per_cohort_bps > 0 {
+        let next_p2p = ctx.accounts.cohort.p2p_positions
+            .checked_add(1)
+            .ok_or(MhiError::Overflow)?;
+        let ratio_threshold = (next_p2p as u64)
+            .checked_mul(VAULT_TO_P2P_RATIO as u64)
+            .ok_or(MhiError::Overflow)?;
+        let ratio_wants_p2p = (ctx.accounts.cohort.total_positions as u64) >= ratio_threshold;
+
+        if ratio_wants_p2p {
+            let pool = &ctx.accounts.p2p_pool;
+            let pool_total = pool.available_lamports
+                .checked_add(pool.active_collateral_lamports)
+                .ok_or(MhiError::Overflow)?;
+            let p2p_max_cohort = mul_bps_u16(pool_total, max_risk_per_cohort_bps)
+                .ok_or(MhiError::Overflow)?;
+            let p2p_new_locked = ctx.accounts.cohort.p2p_collateral_locked
+                .checked_add(collateral)
+                .ok_or(MhiError::Overflow)?;
+            let p2p_can_serve = pool.available_lamports >= collateral
+                && p2p_new_locked <= p2p_max_cohort;
+            require!(!p2p_can_serve, MhiError::RouteToP2p);
         }
     }
 

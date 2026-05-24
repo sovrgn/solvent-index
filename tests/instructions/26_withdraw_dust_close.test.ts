@@ -29,10 +29,8 @@ async function setupP2pProtocol(seedSol = 5, poolDeposit = 5): Promise<{
   const writer = await fundedKeypair(t.context, 1000);
   const buyer = await fundedKeypair(t.context, 1000);
 
-  // Init pool
+  // P2P pool already initialized by setupProtocol.
   const [pool] = findP2pPoolPda(t.program.programId);
-  await (t.program.methods as any).initP2PPool()
-    .accounts({ authority: t.authority.publicKey, globalState: t.globalState, p2PPool: pool, systemProgram: SystemProgram.programId } as any).rpc();
 
   // Enable P2P
   await (t.program.methods as any).updateP2PConfig({

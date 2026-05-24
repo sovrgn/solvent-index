@@ -294,14 +294,8 @@ describe(`Stress: ${NUM_COHORTS} cohorts, vault(${VAULT_SEED_SOL}) + P2P pool(${
       } as any)
       .rpc();
 
+    // P2P pool already initialized by setupProtocol.
     [poolPda] = PublicKey.findProgramAddressSync([Buffer.from("p2p_pool")], t.program.programId);
-    await (t.program.methods as any).initP2PPool()
-      .accounts({
-        authority: t.authority.publicKey,
-        globalState: t.globalState,
-        p2PPool: poolPda,
-        systemProgram: SystemProgram.programId,
-      } as any).rpc();
 
     // Enable P2P (5% buyer fee + 20% writer fee = 25% protocol take on P2P premiums)
     await (t.program.methods as any).updateP2PConfig({

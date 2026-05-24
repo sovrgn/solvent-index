@@ -140,6 +140,12 @@ pub enum MhiError {
     #[msg("Writer has insufficient available collateral")]
     InsufficientWriterCollateral,
 
+    #[msg("80/20 routing dictates this position goes to P2P - call buy_call_p2p instead")]
+    RouteToP2p,
+
+    #[msg("P2P pool risk cap exceeded for this cohort")]
+    P2pRiskCapExceeded,
+
 
     #[msg("Referrer cannot be the buyer")]
     SelfReferral,

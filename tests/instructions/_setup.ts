@@ -30,6 +30,7 @@ import {
   findCohortPda,
   findPositionPda,
   findP2pPositionPda,
+  findP2pPoolPda,
 } from "../helpers/accounts";
 
 export {
@@ -39,6 +40,7 @@ export {
   findCohortPda,
   findPositionPda,
   findP2pPositionPda,
+  findP2pPoolPda,
 };
 
 export const FAST_TRADING_WINDOW = 3;
@@ -82,6 +84,7 @@ export interface TestCtx {
   globalState: PublicKey;
   vault: PublicKey;
   emaState: PublicKey;
+  p2pPool: PublicKey;
 }
 
 /**
@@ -108,6 +111,7 @@ export async function setupProtocol(opts?: {
   const [globalState] = findGlobalStatePda(program.programId);
   const [vault] = findVaultPda(program.programId);
   const [emaState] = findEmaStatePda(program.programId);
+  const [p2pPool] = findP2pPoolPda(program.programId);
 
   if (!opts?.skipInit) {
     await program.methods
@@ -143,6 +147,19 @@ export async function setupProtocol(opts?: {
         systemProgram: SystemProgram.programId,
       } as any)
       .rpc();
+
+    // Always init the P2P pool — buy_call now requires it as an account even
+    // when P2P is disabled, so the PDA must exist for any test that buys.
+    // The legacy `initP2PPool` (uppercase P) is the name exposed at runtime
+    // for this codebase's Anchor version; tests elsewhere use the same.
+    await (program.methods as any).initP2PPool()
+      .accounts({
+        authority: authority.publicKey,
+        globalState,
+        p2PPool: p2pPool,
+        systemProgram: SystemProgram.programId,
+      } as any)
+      .rpc();
   }
 
   return {
@@ -157,6 +174,7 @@ export async function setupProtocol(opts?: {
     globalState,
     vault,
     emaState,
+    p2pPool,
   };
 }
 
@@ -293,6 +311,7 @@ export async function buyCall(
       buyer: who.publicKey,
       globalState: t.globalState,
       vault: t.vault,
+      p2pPool: t.p2pPool,
       cohort,
       emaState: t.emaState,
       position: posPda,
