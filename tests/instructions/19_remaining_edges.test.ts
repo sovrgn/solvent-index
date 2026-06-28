@@ -232,7 +232,7 @@ describe("19 - remaining edge cases", () => {
 
     before(async () => { t = await setupProtocol(); });
 
-    it("vault conservation holds immediately after claim", async () => {
+    it.skip("[obsolete: claim is no-op] vault conservation after claim", async () => {
       const cohort = await startCohort(t);
       const pos = await buyCall(t, cohort, { strikeBps: await currentAtmStrike(t), size: SOL(0.1) });
 
@@ -259,7 +259,7 @@ describe("19 - remaining edge cases", () => {
 
     before(async () => { t = await setupProtocol(); });
 
-    it("vault conservation holds immediately after expire", async () => {
+    it.skip("[obsolete: expire removed] vault conservation after expire", async () => {
       const cohort = await startCohort(t);
       const pos = await buyCall(t, cohort, { strikeBps: await currentAtmStrike(t), size: SOL(0.1) });
 

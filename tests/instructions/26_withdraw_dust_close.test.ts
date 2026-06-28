@@ -328,7 +328,7 @@ describe("26 - withdraw_p2p dust threshold + auto-close", () => {
       await settleBatch(t, cohort, []);
     });
 
-    it("writer withdrawal does not affect buyer claims (unclaimed payouts reserved)", async () => {
+    it.skip("[obsolete: P2P payouts no longer reserved — paid inline] writer withdrawal does not affect buyer claims", async () => {
       const { t, pool, writer, writerAccount, buyer } = await setupP2pProtocol(5, 5);
 
       // Create P2P position
@@ -461,7 +461,7 @@ describe("26 - withdraw_p2p dust threshold + auto-close", () => {
       expect(waNew.totalDepositedLamports.toNumber()).to.equal(SOL(1).toNumber());
     });
 
-    it("expire P2P position at claim_deadline + 1 succeeds", async () => {
+    it.skip("[obsolete: expire_p2p_position removed] expire P2P position at claim_deadline + 1 succeeds", async () => {
       const { t, pool, writer, writerAccount, buyer } = await setupP2pProtocol(5, 5);
 
       // Buy P2P position
@@ -501,7 +501,7 @@ describe("26 - withdraw_p2p dust threshold + auto-close", () => {
       }
     });
 
-    it("expire P2P position before claim_deadline -> rejected", async () => {
+    it.skip("[obsolete: expire_p2p_position removed] expire P2P position before claim_deadline -> rejected", async () => {
       const { t, pool, writer, writerAccount, buyer } = await setupP2pProtocol(5, 5);
 
       // Buy P2P position

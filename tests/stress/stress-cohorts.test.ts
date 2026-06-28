@@ -4,8 +4,8 @@
  * overflow demand routes to pooled P2P writers. Drives the same on-chain
  * instructions the keeper calls:
  *   start_cohort → buy_call (vault) → buy_call_p2p (overflow) →
- *   submit_mhi → settle_batch → settle_batch_p2p → claim/claim_p2p →
- *   expire → close_cohort
+ *   submit_mhi → settle_batch → settle_batch_p2p (payouts atomic) →
+ *   close_position / close_p2p_position → close_cohort
  *
  * Uses the keeper's MHI computation library with empirical return data.
  *
@@ -22,6 +22,7 @@ import {
   findCohortPda,
   findPositionPda,
   findP2pPositionPda,
+  deriveStrikes,
   SOL,
   FAST_CLAIM_EXPIRY,
   FAST_TRADING_WINDOW,
@@ -40,7 +41,10 @@ function computeMhi(returns: number[]): number {
   return Math.round(median * 10_000);
 }
 
-const NUM_COHORTS = 10_000;
+// Default is the full 10K-cohort run. Override with STRESS_COHORTS=<n> for a
+// fast smoke run (e.g. STRESS_COHORTS=50) — coverage of the full path is
+// identical, only the iteration count changes.
+const NUM_COHORTS = Number(process.env.STRESS_COHORTS ?? 10_000);
 const VAULT_SEED_SOL = 200;
 const POOL_SEED_SOL = 30;         // Total P2P pool deposit across all writers
 const NUM_WRITERS = 5;
@@ -111,8 +115,7 @@ function sampleMhiBps(): number {
   return computeMhi(returns);
 }
 
-function randomStrike(): number {
-  const strikes = [10_000, 11_000, 12_000, 13_000, 15_000, 18_000, 20_000];
+function randomStrike(strikes: number[]): number {
   return strikes[Math.floor(Math.random() * strikes.length)]!;
 }
 
@@ -344,7 +347,9 @@ describe(`Stress: ${NUM_COHORTS} cohorts, vault(${VAULT_SEED_SOL}) + P2P pool(${
     const startTime = Date.now();
 
     for (let c = 0; c < NUM_COHORTS; c++) {
-      const mhiBps = sampleMhiBps();
+      // submit_mhi rejects mhi_bps > cap; the real keeper clamps before
+      // submitting, so mirror that here.
+      const mhiBps = Math.min(sampleMhiBps(), MHI_CAP_BPS);
       mhiSum += mhiBps;
       if (mhiBps < mhiMin) mhiMin = mhiBps;
       if (mhiBps > mhiMax) mhiMax = mhiBps;
@@ -357,14 +362,19 @@ describe(`Stress: ${NUM_COHORTS} cohorts, vault(${VAULT_SEED_SOL}) + P2P pool(${
       const idx = gs.currentCohortIndex.toNumber();
       const [cohortPda] = findCohortPda(t.program.programId, idx);
 
+      // start_cohort requires strikes == derive_strikes(strike_anchor_bps)
+      // exactly, and buy_call only accepts strikes from this ladder. The anchor
+      // drifts each cohort, so derive fresh every round.
+      const cohortStrikes = deriveStrikes((gs as any).strikeAnchorBps as number);
+
       await t.program.methods
-        .startCohort()
+        .startCohort(cohortStrikes)
         .accounts({
           keeper: t.keeper.publicKey,
           globalState: t.globalState,
           vault: t.vault,
-          emaState: t.emaState,
           cohort: cohortPda,
+          systemProgram: SystemProgram.programId,
         } as any)
         .signers([t.keeper])
         .rpc();
@@ -393,7 +403,7 @@ describe(`Stress: ${NUM_COHORTS} cohorts, vault(${VAULT_SEED_SOL}) + P2P pool(${
         + (vaultForSizing.activeCollateralLamports as anchor.BN).toNumber()) / LAMPORTS_PER_SOL;
 
       for (const buyer of cohortBuyers) {
-        const strike = randomStrike();
+        const strike = randomStrike(cohortStrikes);
         const size = randomSize(vaultTotalSol, strike);
         const nonce = 0;
 
@@ -409,9 +419,11 @@ describe(`Stress: ${NUM_COHORTS} cohorts, vault(${VAULT_SEED_SOL}) + P2P pool(${
               buyer: buyer.publicKey,
               globalState: t.globalState,
               vault: t.vault,
+              p2pPool: poolPda,
               cohort: cohortPda,
               emaState: t.emaState,
               position: vaultPosPda,
+              systemProgram: SystemProgram.programId,
             } as any)
             .signers([buyer])
             .rpc();
@@ -502,7 +514,12 @@ describe(`Stress: ${NUM_COHORTS} cohorts, vault(${VAULT_SEED_SOL}) + P2P pool(${
               cohort: cohortPda,
             } as any)
             .remainingAccounts(
-              batch.map((p) => ({ pubkey: p.pda, isWritable: true, isSigner: false })),
+              // settle now expects (position, owner) pairs: payout is sent to
+              // the owner directly in the same tx, no separate claim step.
+              batch.flatMap((p) => [
+                { pubkey: p.pda, isWritable: true, isSigner: false },
+                { pubkey: p.buyer.publicKey, isWritable: true, isSigner: false },
+              ]),
             )
             .signers([t.keeper])
             .rpc();
@@ -533,7 +550,12 @@ describe(`Stress: ${NUM_COHORTS} cohorts, vault(${VAULT_SEED_SOL}) + P2P pool(${
               cohort: cohortPda,
             } as any)
             .remainingAccounts(
-              batch.map((p) => ({ pubkey: p.pda, isWritable: true, isSigner: false })),
+              // settle now expects (position, owner) pairs: payout is sent to
+              // the owner directly in the same tx, no separate claim step.
+              batch.flatMap((p) => [
+                { pubkey: p.pda, isWritable: true, isSigner: false },
+                { pubkey: p.buyer.publicKey, isWritable: true, isSigner: false },
+              ]),
             )
             .signers([t.keeper])
             .rpc();
@@ -558,19 +580,19 @@ describe(`Stress: ${NUM_COHORTS} cohorts, vault(${VAULT_SEED_SOL}) + P2P pool(${
           winnerPayouts += payout;
           recordProfit(p, payout, mhiBps, c, "vault");
           recordTopMult(mult, p, payout, mhiBps, c, "vault");
-
-          await t.program.methods
-            .claim()
-            .accounts({
-              caller: p.buyer.publicKey,
-              owner: p.buyer.publicKey,
-              vault: t.vault,
-              cohort: cohortPda,
-              position: p.pda,
-            } as any)
-            .signers([p.buyer])
-            .rpc();
         }
+
+        // Payout was delivered atomically at settle (no claim step). Reclaim
+        // the settled position PDA's rent so the 10K-cohort run stays bounded.
+        await t.program.methods
+          .closePosition()
+          .accounts({
+            caller: t.keeper.publicKey,
+            position: p.pda,
+            systemProgram: SystemProgram.programId,
+          } as any)
+          .signers([t.keeper])
+          .rpc();
       }
 
       for (const p of p2pPosPdas) {
@@ -594,25 +616,17 @@ describe(`Stress: ${NUM_COHORTS} cohorts, vault(${VAULT_SEED_SOL}) + P2P pool(${
           winnerPayouts += payout;
           recordProfit(p, payout, mhiBps, c, "p2p");
           recordTopMult(mult, p, payout, mhiBps, c, "p2p");
-
-          try {
-            await (t.program.methods as any).claimP2P()
-              .accounts({
-                caller: p.buyer.publicKey,
-                owner: p.buyer.publicKey,
-                p2PPool: poolPda,
-                cohort: cohortPda,
-                p2PPosition: p.pda,
-                systemProgram: SystemProgram.programId,
-              } as any)
-              .signers([p.buyer])
-              .rpc();
-          } catch { /* claim may fail if pool drained */ }
         }
-      }
 
-      if (vaultPosPdas.length > 0 || p2pPosPdas.length > 0) {
-        await warpTime(t.context, FAST_CLAIM_EXPIRY + 1);
+        // P2P payout delivered atomically at settle_batch_p2p. Reclaim rent.
+        await (t.program.methods as any).closeP2PPosition()
+          .accounts({
+            caller: t.keeper.publicKey,
+            position: p.pda,
+            systemProgram: SystemProgram.programId,
+          } as any)
+          .signers([t.keeper])
+          .rpc();
       }
 
       const cohortFailed = numBuyers - vaultPosPdas.length - p2pPosPdas.length;
@@ -631,6 +645,7 @@ describe(`Stress: ${NUM_COHORTS} cohorts, vault(${VAULT_SEED_SOL}) + P2P pool(${
         .accounts({
           caller: t.keeper.publicKey,
           globalState: t.globalState,
+          authority: t.authority.publicKey,
           cohort: cohortPda,
         } as any)
         .signers([t.keeper])
@@ -680,6 +695,7 @@ describe(`Stress: ${NUM_COHORTS} cohorts, vault(${VAULT_SEED_SOL}) + P2P pool(${
                   authority: t.authority.publicKey,
                   globalState: t.globalState,
                   vault: t.vault,
+                  systemProgram: SystemProgram.programId,
                 } as any)
                 .rpc();
               totalExtracted += excess;

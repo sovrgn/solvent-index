@@ -78,12 +78,23 @@ pub mod mhi {
     }
 
 
-    pub fn claim(ctx: Context<Claim>) -> Result<()> {
-        instructions::claim::handler(ctx)
+    // `claim`, `expire_position`, `claim_p2p`, and `expire_p2p_position`
+    // were all removed: settle_batch and settle_batch_p2p (and the matching
+    // void instructions) now pay the owner directly inside the same tx, and
+    // mark the position PDA settled+claimed. There is no post-settle state
+    // for the user to act on.
+    //
+    // close_position / close_p2p_position reclaim the PDA's ~0.002 SOL rent
+    // for whoever calls them (preserving third-party cleanup incentive
+    // analogous to the old expire instructions, without the obsolete
+    // forfeit-payout semantics).
+
+    pub fn close_position(ctx: Context<ClosePosition>) -> Result<()> {
+        instructions::close_position::handler(ctx)
     }
 
-    pub fn expire_position(ctx: Context<ExpirePosition>) -> Result<()> {
-        instructions::expire_position::handler(ctx)
+    pub fn close_p2p_position(ctx: Context<CloseP2pPosition>) -> Result<()> {
+        instructions::close_p2p_position::handler(ctx)
     }
 
 
@@ -108,10 +119,6 @@ pub mod mhi {
 
     pub fn update_p2p_config(ctx: Context<UpdateP2pConfig>, params: UpdateP2pConfigParams) -> Result<()> {
         instructions::update_p2p_config::handler(ctx, params)
-    }
-
-    pub fn expire_p2p_position(ctx: Context<ExpireP2pPosition>) -> Result<()> {
-        instructions::expire_p2p_position::handler(ctx)
     }
 
     pub fn init_p2p_pool(ctx: Context<InitP2pPool>) -> Result<()> {
@@ -146,8 +153,5 @@ pub mod mhi {
         instructions::settle_batch_p2p::handler(ctx)
     }
 
-    pub fn claim_p2p(ctx: Context<ClaimP2p>) -> Result<()> {
-        instructions::claim_p2p::handler(ctx)
-    }
 
 }

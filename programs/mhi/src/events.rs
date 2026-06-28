@@ -82,6 +82,20 @@ pub struct PositionExpired {
     pub unclaimed_lamports: u64,
 }
 
+/// Emitted by close_position / close_p2p_position when a settled+claimed
+/// position PDA is reclaimed. `rent_recovered` is the lamports refunded to
+/// the caller (~0.002 SOL per PDA). The cohort PDA may already be closed
+/// at this point — the indexer correlates via prior CohortStarted events.
+#[event]
+pub struct PositionClosed {
+    pub cohort: Pubkey,
+    pub owner: Pubkey,
+    pub strike_bps: u32,
+    pub nonce: u8,
+    pub caller: Pubkey,
+    pub rent_recovered: u64,
+}
+
 #[event]
 pub struct VaultWithdrawn {
     pub authority: Pubkey,

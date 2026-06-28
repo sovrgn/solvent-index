@@ -33,7 +33,14 @@ pub struct VoidCohort<'info> {
         bump = cohort.bump,
     )]
     pub cohort: Account<'info, Cohort>,
-    // Remaining accounts: Position accounts to refund (must be mut)
+    // Remaining accounts: (position, owner) pairs.
+    //
+    // For each position to refund, the caller passes the Position PDA
+    // followed by the owner's wallet pubkey. The handler validates
+    // owner.key() == position.owner and transfers the premium refund to
+    // the owner directly — no separate claim step. The position PDA stays
+    // alive marked settled+claimed (a separate close_position sweep
+    // retires the PDA later).
 }
 
 pub fn handler(ctx: Context<VoidCohort>) -> Result<()> {
@@ -65,20 +72,30 @@ pub fn handler(ctx: Context<VoidCohort>) -> Result<()> {
     }
     // else: Voiding status means preconditions were already verified on first call
 
-    // Each remaining account is a Position PDA. We mark it as settled with
-    // payout = premium_paid (full refund) so the buyer can claim it back.
-    // Collateral is released per-position to support batched voids.
+    // Pairs must be balanced; odd count is a caller bug.
+    require!(
+        ctx.remaining_accounts.len() % 2 == 0,
+        MhiError::MalformedSettleAccounts
+    );
 
+    // Each pair is (Position PDA, owner wallet). The buyer is refunded the
+    // FULL premium they paid (including referral portion). The referral
+    // was already transferred during buy_call and cannot be clawed back —
+    // the vault covers this delta from its own reserves. Buyers should not
+    // lose money when a cohort is voided through no fault of their own
+    // (voids are authority-only, past recovery deadline).
     let mut batch_voided = 0u32;
 
-    for account_info in ctx.remaining_accounts.iter() {
-        let mut data = account_info.try_borrow_mut_data()?;
+    for chunk in ctx.remaining_accounts.chunks(2) {
+        let position_ai = &chunk[0];
+        let owner_ai = &chunk[1];
 
         require!(
-            account_info.owner == ctx.program_id,
+            position_ai.owner == ctx.program_id,
             MhiError::CohortMismatch
         );
 
+        let mut data = position_ai.try_borrow_mut_data()?;
         let position = Position::try_deserialize(&mut &data[..])?;
 
         require!(
@@ -86,19 +103,17 @@ pub fn handler(ctx: Context<VoidCohort>) -> Result<()> {
             MhiError::CohortMismatch
         );
 
-        // Skip already processed positions (idempotent)
+        require!(
+            owner_ai.key() == position.owner,
+            MhiError::OwnerMismatch
+        );
+
+        // Idempotent
         if position.settled {
             continue;
         }
 
-        // Refund the FULL premium the buyer paid (including referral portion).
-        // The referral was already transferred to the referrer during buy_call and
-        // cannot be clawed back. The vault covers this delta from its own reserves.
-        // Buyers should not lose money when a cohort is voided through no fault of
-        // their own (voids are authority-only, past recovery deadline).
         let refund = position.premium_paid_lamports;
-
-        // Compute collateral locked for this position (same formula as buy_call)
         let position_collateral = total_collateral_lamports_ceil(
             cap_bps,
             position.strike_bps,
@@ -106,34 +121,41 @@ pub fn handler(ctx: Context<VoidCohort>) -> Result<()> {
         )
         .ok_or(MhiError::Overflow)?;
 
-        // Release per-position collateral and reserve refund
-        {
-            let vault = &mut ctx.accounts.vault;
+        // Vault accounting: release collateral, then pay refund directly.
+        // The unclaimed bucket is no longer used because the refund is
+        // transferred to the owner in the same tx.
+        let vault = &mut ctx.accounts.vault;
+        vault.active_collateral_lamports = vault
+            .active_collateral_lamports
+            .checked_sub(position_collateral)
+            .ok_or(MhiError::Overflow)?;
+        vault.available_lamports = vault
+            .available_lamports
+            .checked_add(position_collateral)
+            .ok_or(MhiError::Overflow)?;
 
-            // Release collateral: active → available
-            vault.active_collateral_lamports = vault
-                .active_collateral_lamports
-                .checked_sub(position_collateral)
-                .ok_or(MhiError::Overflow)?;
+        if refund > 0 {
             vault.available_lamports = vault
                 .available_lamports
-                .checked_add(position_collateral)
+                .checked_sub(refund)
                 .ok_or(MhiError::Overflow)?;
-
-            // Reserve refund: available → unclaimed_payouts
-            if refund > 0 {
-                vault.available_lamports = vault
-                    .available_lamports
-                    .checked_sub(refund)
-                    .ok_or(MhiError::Overflow)?;
-                vault.unclaimed_payouts_lamports = vault
-                    .unclaimed_payouts_lamports
-                    .checked_add(refund)
-                    .ok_or(MhiError::Overflow)?;
-            }
+            vault.cumulative_payouts_lamports = vault
+                .cumulative_payouts_lamports
+                .checked_add(refund)
+                .ok_or(MhiError::Overflow)?;
         }
 
-        // Mark position as settled with premium as payout (refund)
+        // Decrement outstanding (semantically: "positions whose terminal
+        // state has not yet been resolved"). close_cohort gates on this
+        // counter; PDA closure happens separately via close_position.
+        let cohort = &mut ctx.accounts.cohort;
+        cohort.outstanding_positions = cohort
+            .outstanding_positions
+            .checked_sub(1)
+            .ok_or(MhiError::Overflow)?;
+
+        // Mark position settled+claimed with refund as payout. claim_deadline
+        // is zeroed (no claim step), and claimed=true gates close_position.
         let updated = Position {
             bump: position.bump,
             owner: position.owner,
@@ -145,14 +167,21 @@ pub fn handler(ctx: Context<VoidCohort>) -> Result<()> {
             nonce: position.nonce,
             settled: true,
             payout_lamports: refund,
-            claim_deadline: clock
-                .unix_timestamp
-                .checked_add(ctx.accounts.global_state.claim_expiry_seconds as i64)
-                .ok_or(MhiError::Overflow)?,
-            claimed: false,
+            claim_deadline: 0,
+            claimed: true,
         };
         let mut writer = &mut data[..];
         updated.try_serialize(&mut writer)?;
+        drop(data);
+
+        // Direct refund transfer vault → owner.
+        if refund > 0 {
+            **ctx.accounts.vault.to_account_info().try_borrow_mut_lamports()? -= refund;
+            **owner_ai.try_borrow_mut_lamports()? = owner_ai
+                .lamports()
+                .checked_add(refund)
+                .ok_or(MhiError::Overflow)?;
+        }
 
         batch_voided += 1;
     }
@@ -176,7 +205,6 @@ pub fn handler(ctx: Context<VoidCohort>) -> Result<()> {
 
         // Decrement active cohort count (only on final transition)
         if !is_continuation {
-            // First and only call - decrement now
             ctx.accounts.global_state.active_cohorts = ctx
                 .accounts
                 .global_state
@@ -184,8 +212,6 @@ pub fn handler(ctx: Context<VoidCohort>) -> Result<()> {
                 .checked_sub(1)
                 .ok_or(MhiError::Overflow)?;
         }
-        // If continuation (Voiding → Voided), active_cohorts was already decremented
-        // on the first call that set Voiding.
 
         emit!(CohortVoided {
             cohort_index,
@@ -202,7 +228,6 @@ pub fn handler(ctx: Context<VoidCohort>) -> Result<()> {
             .checked_sub(1)
             .ok_or(MhiError::Overflow)?;
     }
-    // else: already Voiding, more batches to come - no status change needed
 
     {
         let v = &ctx.accounts.vault;

@@ -31,7 +31,20 @@ pub struct SettleBatch<'info> {
         bump = cohort.bump,
     )]
     pub cohort: Account<'info, Cohort>,
-    // Remaining accounts: Position accounts to settle (must be mut)
+    // Remaining accounts: (position, owner) pairs.
+    //
+    // For each position to settle, the caller passes the Position PDA followed
+    // by the owner's wallet pubkey. The handler validates owner.key() ==
+    // position.owner and transfers the payout to the owner directly in this
+    // same tx — there is no separate `claim` step.
+    //
+    // The position PDA is NOT closed here. It stays alive marked settled+
+    // claimed as a historical record (and so close_cohort knows there are
+    // still position PDAs referencing this cohort). A separate permissionless
+    // close_position cleanup sweeps the rent later.
+    //
+    // Each pair adds 2 accounts to the tx; batch limit ~25-30 positions per
+    // tx given Solana's 64-account cap minus the 4 fixed accounts above.
 }
 
 pub fn handler(ctx: Context<SettleBatch>) -> Result<()> {
@@ -44,10 +57,8 @@ pub fn handler(ctx: Context<SettleBatch>) -> Result<()> {
     // positions that locked against the at-start cap.
     let keeper = ctx.accounts.global_state.keeper;
     let cap_bps = ctx.accounts.cohort.mhi_cap_bps_at_start;
-    let claim_expiry = ctx.accounts.global_state.claim_expiry_seconds as i64;
     let cohort_key = ctx.accounts.cohort.key();
     let cohort_index = ctx.accounts.cohort.index;
-
 
     // MHI must be submitted
     require!(ctx.accounts.cohort.has_mhi(), MhiError::MhiNotSubmitted);
@@ -70,26 +81,31 @@ pub fn handler(ctx: Context<SettleBatch>) -> Result<()> {
 
     let mhi_bps = ctx.accounts.cohort.mhi_bps;
 
-    // Require at least one position account to prevent empty-call DOS.
-    // Without this, an empty settle_batch would transition status to Settling
-    // without settling any positions, permanently locking the cohort.
+    // Empty-call is allowed iff the cohort has no positions (advances status
+    // from Measuring → Settled). Otherwise require at least one (position,
+    // owner) pair to prevent empty-call DOS.
     require!(
         !ctx.remaining_accounts.is_empty() || ctx.accounts.cohort.total_positions == 0,
         MhiError::NoPositionsProvided
     );
 
+    // Pairs must be balanced; odd count is a caller bug.
+    require!(
+        ctx.remaining_accounts.len() % 2 == 0,
+        MhiError::MalformedSettleAccounts
+    );
 
-    for account_info in ctx.remaining_accounts.iter() {
-        // Deserialize position
-        let mut data = account_info.try_borrow_mut_data()?;
+    for chunk in ctx.remaining_accounts.chunks(2) {
+        let position_ai = &chunk[0];
+        let owner_ai = &chunk[1];
 
-        // Verify account is owned by this program
+        // Verify account is owned by this program before deserializing.
         require!(
-            account_info.owner == ctx.program_id,
+            position_ai.owner == ctx.program_id,
             MhiError::CohortMismatch
         );
 
-        // Deserialize - skip 8-byte discriminator
+        let mut data = position_ai.try_borrow_mut_data()?;
         let position = Position::try_deserialize(&mut &data[..])?;
 
         // Validate this position belongs to the cohort
@@ -98,7 +114,7 @@ pub fn handler(ctx: Context<SettleBatch>) -> Result<()> {
             MhiError::CohortMismatch
         );
 
-        // Verify account is a legitimate Position PDA
+        // Validate this position's PDA was derived from the expected seeds.
         let strike_bytes = position.strike_bps.to_le_bytes();
         let (expected_pda, _bump) = Pubkey::find_program_address(
             &[
@@ -111,16 +127,25 @@ pub fn handler(ctx: Context<SettleBatch>) -> Result<()> {
             ctx.program_id,
         );
         require!(
-            account_info.key() == expected_pda,
+            position_ai.key() == expected_pda,
             MhiError::CohortMismatch
         );
 
-        // Skip already settled positions (idempotent)
+        // The paired owner account MUST match this position's owner. The
+        // payout transfer below sends SOL to whatever pubkey is passed; if
+        // the caller could pass an arbitrary recipient, they'd steal payouts.
+        require!(
+            owner_ai.key() == position.owner,
+            MhiError::OwnerMismatch
+        );
+
+        // Idempotent: skip already-settled positions (a retry that re-includes
+        // an already-settled position must not double-pay).
         if position.settled {
             continue;
         }
 
-        // Transition to Settling on first actual settlement
+        // Transition cohort to Settling on the first actual settlement.
         if ctx.accounts.cohort.status == CohortStatus::Measuring {
             ctx.accounts.cohort.status = CohortStatus::Settling;
         }
@@ -140,7 +165,11 @@ pub fn handler(ctx: Context<SettleBatch>) -> Result<()> {
         )
         .ok_or(MhiError::Overflow)?;
 
-        // Update vault: release collateral, move payout to unclaimed
+        // Update vault accounting. Active collateral is always released; the
+        // delta between collateral and payout returns to available. The
+        // unclaimed_payouts bucket is no longer touched on this path because
+        // the payout is sent directly to the owner below — there is nothing
+        // left "unclaimed".
         let vault = &mut ctx.accounts.vault;
         vault.active_collateral_lamports = vault
             .active_collateral_lamports
@@ -148,15 +177,10 @@ pub fn handler(ctx: Context<SettleBatch>) -> Result<()> {
             .ok_or(MhiError::Overflow)?;
 
         if payout > 0 {
-            vault.unclaimed_payouts_lamports = vault
-                .unclaimed_payouts_lamports
-                .checked_add(payout)
-                .ok_or(MhiError::Overflow)?;
             vault.cumulative_payouts_lamports = vault
                 .cumulative_payouts_lamports
                 .checked_add(payout)
                 .ok_or(MhiError::Overflow)?;
-
             let returned = position_collateral
                 .checked_sub(payout)
                 .ok_or(MhiError::Overflow)?;
@@ -171,7 +195,12 @@ pub fn handler(ctx: Context<SettleBatch>) -> Result<()> {
                 .ok_or(MhiError::Overflow)?;
         }
 
-        // Update cohort tracking
+        // Update cohort tracking. outstanding_positions now means "positions
+        // whose terminal state has not yet been resolved" (not settled and
+        // not voided), so it can be decremented here even though the position
+        // PDA stays alive. close_cohort gates on outstanding_positions == 0
+        // so it can fire as soon as the last position settles. A separate
+        // permissionless close_position retires the PDA rent later.
         let cohort = &mut ctx.accounts.cohort;
         cohort.vault_payouts_due = cohort
             .vault_payouts_due
@@ -181,13 +210,15 @@ pub fn handler(ctx: Context<SettleBatch>) -> Result<()> {
             .positions_settled
             .checked_add(1)
             .ok_or(MhiError::Overflow)?;
-
-        // Write updated position back
-        let claim_deadline = clock
-            .unix_timestamp
-            .checked_add(claim_expiry)
+        cohort.outstanding_positions = cohort
+            .outstanding_positions
+            .checked_sub(1)
             .ok_or(MhiError::Overflow)?;
 
+        // Write the position back: marked settled AND claimed (the payout
+        // has already left the vault below), and claim_deadline=0 because
+        // there is no claim step. claimed=true also gates the future
+        // close_position cleanup so the position can be retired by anyone.
         let updated_position = Position {
             bump: position.bump,
             owner: position.owner,
@@ -199,11 +230,12 @@ pub fn handler(ctx: Context<SettleBatch>) -> Result<()> {
             nonce: position.nonce,
             settled: true,
             payout_lamports: payout,
-            claim_deadline,
-            claimed: false,
+            claim_deadline: 0,
+            claimed: true,
         };
         let mut writer = &mut data[..];
         updated_position.try_serialize(&mut writer)?;
+        drop(data);
 
         emit!(PositionSettled {
             cohort_index,
@@ -212,6 +244,17 @@ pub fn handler(ctx: Context<SettleBatch>) -> Result<()> {
             size_lamports: position.size_lamports,
             payout_lamports: payout,
         });
+
+        // Direct payout transfer from the vault PDA to the owner's wallet.
+        // Direct lamport manipulation is safe because both accounts are
+        // program-owned and mut-borrowable for the duration of this handler.
+        if payout > 0 {
+            **ctx.accounts.vault.to_account_info().try_borrow_mut_lamports()? -= payout;
+            **owner_ai.try_borrow_mut_lamports()? = owner_ai
+                .lamports()
+                .checked_add(payout)
+                .ok_or(MhiError::Overflow)?;
+        }
     }
 
     // Check if all positions (vault + P2P) are settled, or cohort is empty

@@ -84,7 +84,7 @@ describe("16 - timing boundaries", () => {
 
     before(async () => { t = await setupProtocol(); });
 
-    it("claim at claim_deadline - 1 → succeeds", async () => {
+    it.skip("[obsolete: claim removed] claim at claim_deadline - 1 → succeeds", async () => {
       const cohort = await startCohort(t);
       const live = await currentLiveStrikes(t);
       const pos = await buyCall(t, cohort, { strikeBps: live[2] });
@@ -125,7 +125,7 @@ describe("16 - timing boundaries", () => {
         .rpc();
     }
 
-    it("expire_position at claim_deadline - 1 → ClaimNotExpired", async () => {
+    it.skip("[obsolete: expire removed] expire_position at claim_deadline - 1 → ClaimNotExpired", async () => {
       const cohort = await startCohort(t);
       const live = await currentLiveStrikes(t);
       const pos = await buyCall(t, cohort, { strikeBps: live[2] });
@@ -147,7 +147,7 @@ describe("16 - timing boundaries", () => {
       await claimPosition(t, cohort, pos, t.buyer);
     });
 
-    it("expire_position at claim_deadline → ClaimNotExpired", async () => {
+    it.skip("[obsolete: expire removed] expire_position at claim_deadline → ClaimNotExpired", async () => {
       const cohort = await startCohort(t);
       const live = await currentLiveStrikes(t);
       const pos = await buyCall(t, cohort, { strikeBps: live[2] });
@@ -170,7 +170,7 @@ describe("16 - timing boundaries", () => {
       await expirePosition(cohort, pos);
     });
 
-    it("expire_position at claim_deadline + 1 → succeeds", async () => {
+    it.skip("[obsolete: expire removed] expire_position at claim_deadline + 1 → succeeds", async () => {
       const cohort = await startCohort(t);
       const live = await currentLiveStrikes(t);
       const pos = await buyCall(t, cohort, { strikeBps: live[2] });

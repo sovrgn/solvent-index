@@ -7,6 +7,9 @@ skip-lint = false
 [programs.localnet]
 mhi = "6WMM7hg5JKN6RrwL15qVtRUTZQb3jEoZpiwsPFLyDGG"
 
+[programs.devnet]
+mhi = "6WMM7hg5JKN6RrwL15qVtRUTZQb3jEoZpiwsPFLyDGG"
+
 [registry]
 url = "https://api.apr.dev"
 

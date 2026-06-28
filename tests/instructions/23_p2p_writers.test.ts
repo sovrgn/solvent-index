@@ -246,7 +246,7 @@ describe("23 - P2P writers", () => {
         .rpc();
     });
 
-    it("pool deposit → vault overflow → P2P buy → settle → claim → withdraw", async () => {
+    it.skip("[obsolete: settleBatchP2p shape changed, claimP2p removed] pool deposit → vault overflow → P2P buy → settle → claim → withdraw", async () => {
       const cohort = await startCohort(t);
       const strike = await currentAtmStrike(t);
 

@@ -82,14 +82,13 @@ describe("full lifecycle", () => {
       const collateral = vaultBefore.activeCollateralLamports.toNumber();
       expect(collateral).to.be.greaterThan(0);
 
+      // Sample BEFORE void: refund is delivered inline now.
+      const balBefore = await getBalance(t.context.banksClient, t.buyer.publicKey);
       await voidCohort(t, cohort, [pos]);
+      const balAfter = await getBalance(t.context.banksClient, t.buyer.publicKey);
 
       const vaultAfterVoid = await t.program.account.vault.fetch(t.vault);
       expect(vaultAfterVoid.activeCollateralLamports.toNumber()).to.equal(0);
-
-      const balBefore = await getBalance(t.context.banksClient, t.buyer.publicKey);
-      await claimPosition(t, cohort, pos, t.buyer);
-      const balAfter = await getBalance(t.context.banksClient, t.buyer.publicKey);
 
       expect(balAfter - balBefore).to.be.greaterThan(0);
       await assertVaultConservation(t);
@@ -173,7 +172,7 @@ describe("full lifecycle", () => {
 
     before(async () => { t = await setupProtocol(); });
 
-    it("settle → wait → expire → vault.available increases by payout", async () => {
+    it.skip("[obsolete: expire removed] settle → wait → expire → vault.available increases by payout", async () => {
       const cohort = await startCohort(t);
       const live = await currentLiveStrikes(t);
       const pos = await buyCall(t, cohort, { strikeBps: live[2] });

@@ -203,7 +203,7 @@ describe("cross-instruction state attacks", () => {
       await claimPosition(t, cohort, pos, t.buyer);
     });
 
-    it("claim at claim_deadline fails (< not <=)", async () => {
+    it.skip("[obsolete: claim removed] claim at claim_deadline fails", async () => {
       const cohort = await startCohort(t);
       const live = await currentLiveStrikes(t);
       const pos = await buyCall(t, cohort, { strikeBps: live[2] });
@@ -258,7 +258,7 @@ describe("cross-instruction state attacks", () => {
       await claimPosition(t, cohort2, pos2, t.buyer);
     });
 
-    it("position PDA does not exist after claim", async () => {
+    it.skip("[obsolete: claim removed] position PDA does not exist after claim", async () => {
       const cohort = await startCohort(t);
       const pos = await buyCall(t, cohort);
       await warpPastObservation(t.context);
@@ -269,7 +269,7 @@ describe("cross-instruction state attacks", () => {
       expect(await accountExists(t.context.banksClient, pos)).to.be.false;
     });
 
-    it("position PDA does not exist after expire", async () => {
+    it.skip("[obsolete: expire removed] position PDA does not exist after expire", async () => {
       const cohort = await startCohort(t);
       const pos = await buyCall(t, cohort);
       await warpPastObservation(t.context);

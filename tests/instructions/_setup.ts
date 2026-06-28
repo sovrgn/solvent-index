@@ -349,14 +349,49 @@ export async function submitMhi(
     .rpc();
 }
 
-/** Settle a batch of positions. */
+/**
+ * Settle a batch of positions.
+ *
+ * The on-chain handler now expects (position, owner) pairs in
+ * remaining_accounts so it can transfer payout + position rent directly to
+ * the owner's wallet at settle time — no separate claim is needed.
+ *
+ * Callers may pass either:
+ *   - PublicKey[]: positions only; the helper fetches each position's owner
+ *     from chain via `program.account.position.fetch`. Convenient when the
+ *     test already has the position PDAs but not the owner pubkeys.
+ *   - Array<{ pubkey, owner }>: rich form, no extra fetches. Useful when the
+ *     test wants to deliberately pass a wrong owner to exercise the
+ *     OwnerMismatch error path.
+ *   - Skipped (already-closed) positions: pass `{ pubkey, owner }` with any
+ *     valid pubkey for owner; on-chain code skips closed positions before
+ *     reading owner, so the mismatch never matters.
+ */
 export async function settleBatch(
   t: TestCtx,
   cohort: PublicKey,
-  positions: PublicKey[],
+  positions: Array<PublicKey | { pubkey: PublicKey; owner: PublicKey }>,
   caller?: Keypair,
 ): Promise<void> {
   const who = caller ?? t.keeper;
+
+  const pairs: Array<{ pubkey: PublicKey; owner: PublicKey }> = [];
+  for (const p of positions) {
+    if (p instanceof PublicKey) {
+      // Derive owner from chain. The position must exist; for already-closed
+      // positions the caller must use the rich form.
+      const pos = await t.program.account.position.fetch(p);
+      pairs.push({ pubkey: p, owner: pos.owner });
+    } else {
+      pairs.push(p);
+    }
+  }
+
+  const remaining = pairs.flatMap(({ pubkey, owner }) => [
+    { pubkey, isWritable: true, isSigner: false },
+    { pubkey: owner, isWritable: true, isSigner: false },
+  ]);
+
   await t.program.methods
     .settleBatch()
     .accounts({
@@ -365,35 +400,50 @@ export async function settleBatch(
       vault: t.vault,
       cohort,
     } as any)
-    .remainingAccounts(positions.map((pk) => ({ pubkey: pk, isWritable: true, isSigner: false })))
+    .remainingAccounts(remaining)
     .signers([who])
     .rpc();
 }
 
-/** Claim a position. */
+/**
+ * Vestigial no-op shim. The `claim` instruction was removed when settle_batch
+ * became atomic with payout (the owner receives the SOL at settle time, and
+ * the position PDA is closed in the same tx). Tests that called
+ * `claimPosition` in their happy path can leave the call in place — it
+ * resolves immediately and the post-claim state assertions are unaffected
+ * because the work happened at settle. Tests that specifically asserted
+ * claim-step behaviour (unclaimedPayouts decrement, PayoutClaimed event) are
+ * obsolete and should be removed.
+ */
 export async function claimPosition(
-  t: TestCtx,
-  cohort: PublicKey,
-  position: PublicKey,
-  owner: Keypair,
-  caller?: Keypair,
+  _t: TestCtx,
+  _cohort: PublicKey,
+  _position: PublicKey,
+  _owner: Keypair,
+  _caller?: Keypair,
 ): Promise<void> {
-  const who = caller ?? owner;
-  await t.program.methods
-    .claim()
-    .accounts({
-      caller: who.publicKey,
-      owner: owner.publicKey,
-      vault: t.vault,
-      cohort,
-      position,
-      systemProgram: SystemProgram.programId,
-    } as any)
-    .signers([who])
-    .rpc();
+  // intentionally no-op
 }
 
-/** Run a full cohort: start → buy → warp → submit → settle → claim. Returns cohortPda. */
+/** Vestigial no-op shim — see claimPosition. expire_position was removed
+ *  along with claim. */
+export async function expirePosition(
+  _t: TestCtx,
+  _cohort: PublicKey,
+  _position: PublicKey,
+  _caller?: Keypair,
+): Promise<void> {
+  // intentionally no-op
+}
+
+/**
+ * Run a full cohort: start → buy → warp → submit → settle. Returns cohortPda.
+ *
+ * Settlement is now the terminal step for ITM positions — the on-chain
+ * settle_batch transfers payout + position rent directly to the owner's
+ * wallet. There is no claim step (claim/expire are vestigial). The
+ * `skipClaim` flag is preserved for source compatibility but is a no-op.
+ */
 export async function runFullCohort(
   t: TestCtx,
   mhiBps: number = 14_000,
@@ -408,24 +458,48 @@ export async function runFullCohort(
   await warpPastObservation(t.context);
   await submitMhi(t, cohort, mhiBps);
   if (opts?.skipSettle) return { cohort, positions: posPdas };
-  await settleBatch(t, cohort, posPdas);
-  if (opts?.skipClaim) return { cohort, positions: posPdas };
-  for (let i = 0; i < positions.length; i++) {
-    await claimPosition(t, cohort, posPdas[i], positions[i].buyer ?? t.buyer);
-  }
+  // Pair each position with its buyer so settle can transfer the payout
+  // directly. Default buyer comes from t.buyer (matches buyCall's default).
+  const pairs = posPdas.map((pubkey, i) => ({
+    pubkey,
+    owner: (positions[i]?.buyer ?? t.buyer).publicKey,
+  }));
+  await settleBatch(t, cohort, pairs);
   return { cohort, positions: posPdas };
 }
 
-/** Void a cohort (warp past recovery deadline first). */
+/**
+ * Void a cohort (warp past recovery deadline first).
+ *
+ * Same (position, owner) pair contract as settleBatch — void_cohort now
+ * refunds the premium directly to the owner and closes the position PDA
+ * inline. Passing PublicKey[] makes the helper auto-derive owners from chain.
+ */
 export async function voidCohort(
   t: TestCtx,
   cohort: PublicKey,
-  positions: PublicKey[] = [],
+  positions: Array<PublicKey | { pubkey: PublicKey; owner: PublicKey }> = [],
 ): Promise<void> {
   const recoveryWait =
     FAST_TRADING_WINDOW + FAST_MEASUREMENT + FAST_OBSERVATION +
     FAST_SETTLEMENT_DEADLINE + FAST_SETTLEMENT_DEADLINE + 3;
   await warpTime(t.context, recoveryWait);
+
+  const pairs: Array<{ pubkey: PublicKey; owner: PublicKey }> = [];
+  for (const p of positions) {
+    if (p instanceof PublicKey) {
+      const pos = await t.program.account.position.fetch(p);
+      pairs.push({ pubkey: p, owner: pos.owner });
+    } else {
+      pairs.push(p);
+    }
+  }
+
+  const remaining = pairs.flatMap(({ pubkey, owner }) => [
+    { pubkey, isWritable: true, isSigner: false },
+    { pubkey: owner, isWritable: true, isSigner: false },
+  ]);
+
   await t.program.methods
     .voidCohort()
     .accounts({
@@ -434,7 +508,7 @@ export async function voidCohort(
       vault: t.vault,
       cohort,
     } as any)
-    .remainingAccounts(positions.map((pk) => ({ pubkey: pk, isWritable: true, isSigner: false })))
+    .remainingAccounts(remaining)
     .rpc();
 }
 

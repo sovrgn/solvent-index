@@ -178,7 +178,10 @@ describe("18 - referral edge cases", () => {
 
       const vaultPremium = posData.vaultPremiumLamports.toNumber();
 
+      // Sample BEFORE void: refund is delivered inline now.
+      const balBefore = await getBalance(t.context.banksClient, t.buyer.publicKey);
       await voidCohort(t, cohort, [posPda]);
+      const balAfter = await getBalance(t.context.banksClient, t.buyer.publicKey);
 
       const posAfterVoid = await t.program.account.position.fetch(posPda);
       expect(posAfterVoid.settled).to.equal(true);
@@ -186,10 +189,6 @@ describe("18 - referral edge cases", () => {
       expect(posAfterVoid.payoutLamports.toNumber()).to.equal(
         posData.premiumPaidLamports.toNumber(),
       );
-
-      const balBefore = await getBalance(t.context.banksClient, t.buyer.publicKey);
-      await claimPosition(t, cohort, posPda, t.buyer);
-      const balAfter = await getBalance(t.context.banksClient, t.buyer.publicKey);
 
       expect(balAfter).to.be.greaterThan(balBefore);
       await assertVaultConservation(t);

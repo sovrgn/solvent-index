@@ -98,6 +98,15 @@ pub enum MhiError {
     #[msg("No position accounts provided for settlement")]
     NoPositionsProvided,
 
+    #[msg("Settle remaining_accounts must come in (position, owner) pairs")]
+    MalformedSettleAccounts,
+
+    #[msg("Owner account does not match position.owner")]
+    OwnerMismatch,
+
+    #[msg("Position is not yet claimed (settle has not delivered the payout)")]
+    PositionNotClaimed,
+
     #[msg("Position has already been claimed")]
     AlreadyClaimed,
 

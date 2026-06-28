@@ -19,6 +19,22 @@ describe("void_cohort", () => {
     FAST_SETTLEMENT_DEADLINE + FAST_SETTLEMENT_DEADLINE + 3;
 
   async function doVoid(cohort: any, positions: any[] = [], caller = t.authority) {
+    // void_cohort now expects (position, owner) pairs in remaining_accounts
+    // and refunds premium directly to the owner. Derive owners from chain
+    // when callers pass bare PublicKey[].
+    const pairs: Array<{ pubkey: any; owner: any }> = [];
+    for (const p of positions) {
+      if (p?.pubkey && p?.owner) {
+        pairs.push(p);
+      } else {
+        const pos = await t.program.account.position.fetch(p);
+        pairs.push({ pubkey: p, owner: pos.owner });
+      }
+    }
+    const remaining = pairs.flatMap(({ pubkey, owner }) => [
+      { pubkey, isWritable: true, isSigner: false },
+      { pubkey: owner, isWritable: true, isSigner: false },
+    ]);
     await t.program.methods
       .voidCohort()
       .accounts({
@@ -27,7 +43,7 @@ describe("void_cohort", () => {
         vault: t.vault,
         cohort,
       } as any)
-      .remainingAccounts(positions.map((pk: any) => ({ pubkey: pk, isWritable: true, isSigner: false })))
+      .remainingAccounts(remaining)
       .signers(caller === t.authority ? [] : [caller])
       .rpc();
   }
@@ -43,19 +59,21 @@ describe("void_cohort", () => {
       const vaultPremium = posBefore.vaultPremiumLamports.toNumber();
 
       await warpTime(t.context, RECOVERY_WAIT);
+      // Sample the buyer's balance BEFORE void: the refund is now transferred
+      // directly to the owner inside void_cohort, not via a later claim step.
+      const balBefore = await getBalance(t.context.banksClient, t.buyer.publicKey);
       await doVoid(cohort, [pos]);
+      const balAfter = await getBalance(t.context.banksClient, t.buyer.publicKey);
 
       const cohortData = await t.program.account.cohort.fetch(cohort);
       expect(JSON.stringify(cohortData.status)).to.include("voided");
 
       const posAfter = await t.program.account.position.fetch(pos);
       expect(posAfter.settled).to.equal(true);
+      expect(posAfter.claimed).to.equal(true); // void delivers the refund inline
       expect(posAfter.payoutLamports.toNumber()).to.equal(vaultPremium);
 
-      // Claim the refund
-      const balBefore = await getBalance(t.context.banksClient, t.buyer.publicKey);
-      await claimPosition(t, cohort, pos, t.buyer);
-      const balAfter = await getBalance(t.context.banksClient, t.buyer.publicKey);
+      // Refund landed in the buyer's wallet as part of the void tx.
       expect(balAfter).to.be.greaterThan(balBefore);
 
       await assertVaultConservation(t);
