@@ -6,9 +6,16 @@ use crate::state::{Cohort, GlobalState};
 
 #[derive(Accounts)]
 pub struct CloseCohort<'info> {
-    /// Anyone can trigger the close - they pay the tx fee, but the
-    /// rent refund always goes to `authority`.
-    #[account(mut)]
+    /// The keeper triggers the close and RECEIVES the cohort rent refund. The
+    /// keeper funded that rent when it created the cohort at start_cohort, so
+    /// returning it here makes cohort creation rent-neutral over the round's
+    /// life (the keeper only ever spends tx fees). Keeper-only on purpose: the
+    /// rent must return to the wallet that paid it, not to a third party who
+    /// front-runs the close to snipe it.
+    #[account(
+        mut,
+        constraint = caller.key() == global_state.keeper @ MhiError::UnauthorizedKeeper,
+    )]
     pub caller: Signer<'info>,
 
     #[account(
@@ -17,19 +24,11 @@ pub struct CloseCohort<'info> {
     )]
     pub global_state: Account<'info, GlobalState>,
 
-    /// CHECK: validated against global_state.authority via the address
-    /// constraint. Pure rent destination - no data is read.
-    #[account(
-        mut,
-        address = global_state.authority @ MhiError::UnauthorizedAuthority,
-    )]
-    pub authority: UncheckedAccount<'info>,
-
     #[account(
         mut,
         seeds = [COHORT_SEED, cohort.index.to_le_bytes().as_ref()],
         bump = cohort.bump,
-        close = authority,
+        close = caller,
     )]
     pub cohort: Account<'info, Cohort>,
 }
@@ -60,7 +59,8 @@ pub fn handler(ctx: Context<CloseCohort>) -> Result<()> {
         MhiError::ClaimNotExpired
     );
 
-    // Anchor's `close = authority` handles zeroing, rent refund to authority,
-    // and owner reassignment to system program.
+    // Anchor's `close = caller` handles zeroing, rent refund to the keeper
+    // (the caller, validated == global_state.keeper), and owner reassignment to
+    // the system program.
     Ok(())
 }

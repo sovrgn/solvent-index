@@ -223,7 +223,7 @@ describe("16 - timing boundaries", () => {
 
     before(async () => { t = await setupProtocol(); });
 
-    async function closeCohort(cohort: any, caller = t.randomUser) {
+    async function closeCohort(cohort: any, caller = t.keeper) {
       await t.program.methods
         .closeCohort()
         .accounts({

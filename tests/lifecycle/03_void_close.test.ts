@@ -398,24 +398,25 @@ describe.skip("mhi protocol - void & close", () => {
       // Warp past settlement_deadline + claim_expiry
       await warpTime(context, FAST_SETTLEMENT_DEADLINE + FAST_CLAIM_EXPIRY + 3);
 
-      const callerBalBefore = await getBalance(context.banksClient, randomUser.publicKey);
+      const callerBalBefore = await getBalance(context.banksClient, keeper.publicKey);
 
+      // Close is keeper-only — the keeper reclaims the rent it paid at start.
       await program.methods
         .closeCohort()
         .accounts({
-          caller: randomUser.publicKey,
+          caller: keeper.publicKey,
           globalState: globalStatePda,
           cohort: cohortPda,
         } as any)
-        .signers([randomUser])
+        .signers([keeper])
         .rpc();
 
       // Cohort PDA should no longer exist
       const cohortAccount = await getAccountOrNull(context.banksClient, cohortPda);
       expect(cohortAccount).to.be.null;
 
-      // Caller received rent refund
-      const callerBalAfter = await getBalance(context.banksClient, randomUser.publicKey);
+      // Keeper received the rent refund (net of the tx fee it paid to close)
+      const callerBalAfter = await getBalance(context.banksClient, keeper.publicKey);
       expect(callerBalAfter).to.be.greaterThan(callerBalBefore);
     });
 
@@ -467,11 +468,11 @@ describe.skip("mhi protocol - void & close", () => {
         await program.methods
           .closeCohort()
           .accounts({
-            caller: randomUser.publicKey,
+            caller: keeper.publicKey,
             globalState: globalStatePda,
             cohort: cohortPda,
           } as any)
-          .signers([randomUser])
+          .signers([keeper])
           .rpc();
         expect.fail("Should have thrown");
       } catch (err: any) {
@@ -501,11 +502,11 @@ describe.skip("mhi protocol - void & close", () => {
         await (program.methods
           .closeCohort()
           .accounts({
-            caller: randomUser.publicKey,
+            caller: keeper.publicKey,
             globalState: globalStatePda,
             cohort: cohortPda,
           } as any)
-          .signers([randomUser])
+          .signers([keeper])
           .rpc());
         expect.fail("Should have thrown");
       } catch (err: any) {

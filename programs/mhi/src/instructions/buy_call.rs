@@ -128,6 +128,12 @@ pub fn handler<'info>(
     // retroactively change collateral / premium ceilings for this cohort.
     let mhi_cap_bps = ctx.accounts.cohort.mhi_cap_bps_at_start;
 
+    // A strike at or above the cap has zero payoff room, so the collateral
+    // math below (`cap - strike`) underflows and would surface as a bare
+    // `Overflow`. Reject it by name instead — the buyer is being quoted a
+    // slot that can never pay, which is a ladder defect, not arithmetic.
+    require!(strike_bps < mhi_cap_bps, MhiError::StrikeExceedsCap);
+
     let charged_bps_raw = charged_premium_bps(fair_bps, total_markup_u16)
         .ok_or(MhiError::Overflow)?;
     // Cap charged BPS at the maximum payoff per unit (collateral cap, using

@@ -107,6 +107,10 @@ pub fn handler(
     // retroactively change collateral / premium ceilings for this cohort.
     let mhi_cap_bps = ctx.accounts.cohort.mhi_cap_bps_at_start;
 
+    // Same guard as `buy_call`: a strike at or above the cap has no payoff
+    // room, so the collateral math below underflows into a bare `Overflow`.
+    require!(strike_bps < mhi_cap_bps, MhiError::StrikeExceedsCap);
+
     let collateral = total_collateral_lamports_ceil(
         mhi_cap_bps, strike_bps, size_lamports,
     ).ok_or(MhiError::Overflow)?;

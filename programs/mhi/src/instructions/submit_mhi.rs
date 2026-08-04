@@ -126,6 +126,19 @@ pub fn handler(
         if strike == 0 {
             continue;
         }
+        // A strike at or above the cohort's cap has no payoff room: every
+        // `cap - strike` in the payoff/collateral path underflows on it.
+        // `buy_call` rejects such strikes so no position can exist here, and
+        // the anchor ceiling stops new ladders from containing them — but
+        // cohorts opened before that ceiling landed still carry them, and
+        // aborting the whole instruction over a slot nobody can trade would
+        // strand those cohorts forever. Skip the slot, leaving its EMAs
+        // untouched rather than decaying them toward zero (a decayed EMA
+        // would underprice the slot the moment the anchor falls back and
+        // makes it tradeable again).
+        if strike >= mhi_cap_bps {
+            continue;
+        }
         let (new_fast, new_slow) = update_slot_frac_emas(
             effective_mhi,
             strike,
@@ -150,9 +163,17 @@ pub fn handler(
             adjust_strike_demand_markup(ema.slots[i].demand_markup_bps, share);
     }
 
-    // Anchor + settlement-count update.
-    let new_anchor = update_strike_anchor(prev_anchor_bps, effective_mhi, prev_settlement_count)
-        .ok_or(MhiError::Overflow)?;
+    // Anchor + settlement-count update. Ceilinged against the CURRENT global
+    // cap (not the cohort snapshot) because the anchor it produces is what the
+    // NEXT cohort's ladder is derived from, and that cohort will snapshot the
+    // global cap as it stands then.
+    let new_anchor = update_strike_anchor(
+        prev_anchor_bps,
+        effective_mhi,
+        prev_settlement_count,
+        global_mhi_cap_bps,
+    )
+    .ok_or(MhiError::Overflow)?;
     let gs = &mut ctx.accounts.global_state;
     gs.strike_anchor_bps = new_anchor;
     gs.strike_anchor_settlement_count = prev_settlement_count

@@ -164,4 +164,7 @@ pub enum MhiError {
 
     #[msg("Position has already been claimed")]
     PositionAlreadyClaimed,
+
+    #[msg("Strike is at or above the MHI cap and can never pay out")]
+    StrikeExceedsCap,
 }

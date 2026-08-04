@@ -3,7 +3,7 @@ use anchor_lang::prelude::*;
 use crate::constants::{COHORT_SEED, GLOBAL_STATE_SEED, NUM_STRIKES, VAULT_SEED};
 use crate::errors::MhiError;
 use crate::events::CohortStarted;
-use crate::math::ema::derive_strikes;
+use crate::math::ema::{clamp_anchor_for_cap, derive_strikes};
 use crate::state::{Cohort, CohortStatus, GlobalState, Vault};
 
 #[derive(Accounts)]
@@ -52,8 +52,24 @@ pub fn handler(ctx: Context<StartCohort>, strikes: [u32; NUM_STRIKES]) -> Result
     // Catches: keeper running with a stale local anchor view (e.g., feeding raw
     // unclamped MHI into its local strike-anchor instead of the chain's clamped
     // value), or a mismatched multiplier constant.
-    let expected = derive_strikes(gs.strike_anchor_bps);
+    //
+    // The anchor is ceilinged against the cap before derivation. `submit_mhi`
+    // already stores a ceilinged anchor, so this is normally a no-op — it
+    // matters for an anchor written before the ceiling existed, and after an
+    // `update_config` that lowers `mhi_cap_bps` beneath the standing anchor.
+    // Without it the ladder's top slot lands above the cap, `cap - strike`
+    // underflows in settlement, and the cohort can never resolve.
+    let effective_anchor = clamp_anchor_for_cap(gs.strike_anchor_bps, gs.mhi_cap_bps);
+    let expected = derive_strikes(effective_anchor);
     require!(strikes == expected, MhiError::StrikesDoNotMatchAnchor);
+
+    // The ladder is only settleable if every slot leaves payoff room under the
+    // cap. Guaranteed by the clamp above; asserted so a future change to the
+    // multiplier table or to `max_anchor_for_cap` cannot silently reintroduce
+    // unsettleable cohorts.
+    for i in 0..NUM_STRIKES {
+        require!(strikes[i] < gs.mhi_cap_bps, MhiError::StrikeExceedsCap);
+    }
 
     // Defense in depth: monotonic strikes are a property of `derive_strikes`
     // when no slot hits the floor. Asserting it in storage means downstream
@@ -107,7 +123,11 @@ pub fn handler(ctx: Context<StartCohort>, strikes: [u32; NUM_STRIKES]) -> Result
     cohort.outstanding_positions = 0;
     cohort.outstanding_p2p_positions = 0;
     cohort.strikes = strikes;
-    cohort.strike_anchor_bps_at_start = gs.strike_anchor_bps;
+    // Snapshot the anchor the ladder was actually derived from, not the raw
+    // global one. `submit_mhi` uses this as the denominator that turns payoffs
+    // into anchor-relative fractions; if it disagreed with the ladder the EMAs
+    // would be scaled against an anchor that never priced these strikes.
+    cohort.strike_anchor_bps_at_start = effective_anchor;
     cohort.mhi_cap_bps_at_start = gs.mhi_cap_bps;
 
     gs.active_cohorts = gs.active_cohorts.checked_add(1).ok_or(MhiError::Overflow)?;

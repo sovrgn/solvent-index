@@ -10,10 +10,38 @@ export const STRIKE_MULTIPLIERS_BPS = [9_000, 9_500, 10_000, 10_500, 11_000, 12_
 export const STRIKE_ANCHOR_MIN_BPS = 2_000;
 export const STRIKE_ANCHOR_DEFAULT_BPS = 12_500;
 
-/** Off-chain mirror of `crate::math::ema::derive_strikes`. */
-export function deriveStrikes(anchorBps: number): number[] {
+/** Must mirror MAX_STRIKE_MULTIPLIER_BPS in constants.rs. */
+export const MAX_STRIKE_MULTIPLIER_BPS = 13_000;
+/** Must mirror MIN_TOP_STRIKE_HEADROOM_BPS in constants.rs. */
+export const MIN_TOP_STRIKE_HEADROOM_BPS = 2_000;
+/** Must mirror MHI_CAP_BPS_DEFAULT in constants.rs. */
+export const MHI_CAP_BPS_DEFAULT_MIRROR = 30_000;
+
+/** Off-chain mirror of `crate::math::ema::max_anchor_for_cap`. */
+export function maxAnchorForCap(capBps: number): number {
+  const usable = Math.max(0, capBps - MIN_TOP_STRIKE_HEADROOM_BPS);
+  return Math.max(
+    Math.floor((usable * BPS_DENOMINATOR) / MAX_STRIKE_MULTIPLIER_BPS),
+    STRIKE_ANCHOR_MIN_BPS,
+  );
+}
+
+/** Off-chain mirror of `crate::math::ema::clamp_anchor_for_cap`. */
+export function clampAnchorForCap(anchorBps: number, capBps: number): number {
+  return Math.min(Math.max(anchorBps, STRIKE_ANCHOR_MIN_BPS), maxAnchorForCap(capBps));
+}
+
+/**
+ * Off-chain mirror of `crate::math::ema::derive_strikes`, including the
+ * cap-driven anchor clamp `start_cohort` applies before deriving.
+ */
+export function deriveStrikes(
+  anchorBps: number,
+  capBps: number = MHI_CAP_BPS_DEFAULT_MIRROR,
+): number[] {
+  const effective = clampAnchorForCap(anchorBps, capBps);
   return STRIKE_MULTIPLIERS_BPS.map(mult =>
-    Math.max(STRIKE_ANCHOR_MIN_BPS, Math.floor((anchorBps * mult) / BPS_DENOMINATOR)),
+    Math.max(STRIKE_ANCHOR_MIN_BPS, Math.floor((effective * mult) / BPS_DENOMINATOR)),
   );
 }
 

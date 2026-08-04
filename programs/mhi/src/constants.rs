@@ -40,6 +40,19 @@ pub const STRIKE_ANCHOR_DEFAULT_BPS: u32 = 12_500;
 /// Floor below which derived strikes would degenerate. 0.2x.
 pub const STRIKE_ANCHOR_MIN_BPS: u32 = 2_000;
 
+/// Largest entry in `STRIKE_MULTIPLIERS_BPS`. Named separately because the
+/// anchor ceiling below is derived from it; if the ladder ever gains a higher
+/// slot this must move with it (asserted in `math::ema` tests).
+pub const MAX_STRIKE_MULTIPLIER_BPS: u32 = 13_000;
+
+/// Minimum payoff room the TOP strike must retain under `mhi_cap_bps`. 0.2x.
+///
+/// Every payoff and collateral path computes `cap_bps - strike_bps`. A strike
+/// at or above the cap makes that subtraction underflow, and a strike just
+/// below the cap produces an option that can never pay enough to matter. The
+/// anchor is therefore ceilinged so `top_strike + this <= cap` always holds.
+pub const MIN_TOP_STRIKE_HEADROOM_BPS: u32 = 2_000;
+
 /// EMA alpha values (in BPS of BPS_DENOMINATOR)
 /// fast_alpha = 0.15 = 1_500 / 10_000
 pub const FAST_ALPHA_BPS: u32 = 1_500;
