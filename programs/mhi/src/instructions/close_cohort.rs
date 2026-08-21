@@ -41,15 +41,26 @@ pub fn handler(ctx: Context<CloseCohort>) -> Result<()> {
     // Must be settled or voided
     require!(cohort.is_resolved(), MhiError::InvalidCohortStatus);
 
-    // Tight invariant: every Position / P2pPosition PDA derived from this cohort
-    // must have been closed (via claim or expire). Without this, close_cohort
-    // could brick still-open positions because claim and expire both require
-    // the Cohort account to deserialize.
+    // Every position derived from this cohort must have reached a TERMINAL
+    // STATE — settled or voided. That is not the same as its PDA being gone.
+    // `settle_batch` decrements `outstanding_positions` when it settles a
+    // position and pays it out atomically, while the Position PDA lives on
+    // holding rent, so this check can pass with Position PDAs still open.
     //
-    // expire_position / expire_p2p_position are permissionless after
-    // claim_deadline (rent reward → caller), so unclaimed positions get
-    // cleaned up reliably regardless of buyer behaviour. The counter will
-    // reach zero on its own.
+    // That is deliberate and safe: settlement no longer needs the Cohort
+    // account, so closing the cohort cannot strand a settled position. The
+    // PDAs are retired afterwards by the permissionless `close_position` /
+    // `close_p2p_position`, which need only the position itself.
+    //
+    // The trade-off is that once this runs, the cohort no longer indexes its
+    // positions and only a program-wide scan can find them — so whatever
+    // sweeps them must scan by state, not walk cohorts. The keeper's
+    // PositionCloser does exactly that.
+    //
+    // (Historical note: this used to require the PDAs themselves to be gone,
+    // cleaned up by `expire_position` / `expire_p2p_position`. Those
+    // instructions were removed when settlement became atomic — there is no
+    // unclaimed payout left to expire.)
     require!(cohort.is_quiescent(), MhiError::ClaimNotExpired);
 
     // Soft floor: prevent close from running during an in-progress cohort

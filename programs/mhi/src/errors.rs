@@ -62,6 +62,11 @@ pub enum MhiError {
     #[msg("MHI value must be greater than zero")]
     MhiZero,
 
+    // No longer thrown. `submit_mhi` clamps a submission above the cohort's cap
+    // instead of rejecting it (see `effective_mhi_bps`), because a rejection let
+    // a hot market stop settlement while payoff was already truncated at
+    // `cap - strike` anyway. The variant stays so every error code after it
+    // keeps its number — the keeper's IDL and the dashboard decode by code.
     #[msg("MHI value exceeds the cap")]
     MhiExceedsCap,
 

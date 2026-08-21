@@ -211,13 +211,14 @@ its happy path, every error path, and edge cases from audits.
 - [ ] Clock before observation_end → ObservationNotComplete
 - [ ] MHI already submitted (mhi_bps > 0) → MhiAlreadySubmitted
 - [ ] mhi_bps = 0 → MhiZero
-- [ ] mhi_bps > mhi_cap_bps → MhiExceedsCap
+- [ ] mhi_bps > mhi_cap_bps → clamped to the cohort cap, tx succeeds (MhiExceedsCap is no longer thrown)
 - [ ] token_count < MIN_COHORT_TOKENS (10) → InvalidConfig
 
 ### Edge Cases
 - [ ] Submit exactly at observation_end timestamp — succeeds
 - [ ] Submit with empty cohort (0 positions) — succeeds
 - [ ] Submit MHI = mhi_cap_bps (maximum) — succeeds (may be clamped)
+- [ ] Index sustained above the cap across cohorts — every cohort settles, stored MHI pins at the cap
 - [ ] Submit MHI = 1 (minimum) — succeeds (may be clamped)
 - [ ] Clamp disabled (mhi_max_delta_bps = 0) — passes through raw value
 - [ ] Sequential cohorts: verify clamp walks toward target over multiple submissions

@@ -51,6 +51,29 @@ describe("08 - submit_mhi", () => {
       expect(cohortData.mhiBps).to.be.lessThan(30_000);
     });
 
+    it("index sustained above the cap keeps settling, pinned at the cap", async () => {
+      // The liveness property the 6020 fix exists for. A market that stays
+      // above 3.0x used to stop settlement entirely; now every cohort settles,
+      // the delta band walks the stored value up, and it stops at the cap
+      // instead of overshooting it.
+      // Empty cohorts: the property under test is submit/settle liveness, and
+      // buying would couple it to the ladder the moving anchor produces.
+      let stored = 0;
+      let pinnedAfter = 0;
+      for (let i = 1; i <= 6; i++) {
+        const { cohort } = await runFullCohort(t, MHI_CAP_BPS + 50_000, []);
+        stored = (await t.program.account.cohort.fetch(cohort)).mhiBps;
+        expect(stored, `cohort ${i} stored above cap`).to.be.at.most(MHI_CAP_BPS);
+        if (stored === MHI_CAP_BPS && pinnedAfter === 0) pinnedAfter = i;
+      }
+      expect(pinnedAfter, "never reached the cap in 6 cohorts").to.be.greaterThan(0);
+      expect(stored).to.equal(MHI_CAP_BPS);
+
+      // Walk back down so later tests start from a normal index.
+      await runFullCohort(t, 14_000, []);
+      await runFullCohort(t, 14_000, []);
+    });
+
     it("value below -33% → clamped to lower bound", async () => {
       const gs = await t.program.account.globalState.fetch(t.globalState);
       const lastMhi = gs.lastMhiBps;
@@ -110,14 +133,24 @@ describe("08 - submit_mhi", () => {
       await settleBatch(t, cohort, []);
     });
 
-    it("mhi_bps > cap → MhiExceedsCap", async () => {
+    it("mhi_bps > cap → clamped, never rejected", async () => {
+      // Regression (devnet 2026-08-21): this used to revert with
+      // MhiExceedsCap (6020). A median above the cap then stopped settlement
+      // outright: the cohort kept its active_cohorts slot and the keeper
+      // retried every 5s until the market cooled off. Payoff is already
+      // truncated at `cap - strike`, so the rejection protected nothing.
+      const gsBefore = await t.program.account.globalState.fetch(t.globalState);
+      const lastMhi = gsBefore.lastMhiBps;
+
       const cohort = await startCohort(t);
       await warpPastObservation(t.context);
-      await expectError(
-        () => submitMhi(t, cohort, MHI_CAP_BPS + 1),
-        "MhiExceedsCap",
-      );
-      await submitMhi(t, cohort, 14_000);
+      await submitMhi(t, cohort, MHI_CAP_BPS + 50_000);
+
+      const cohortData = await t.program.account.cohort.fetch(cohort);
+      const deltaCeiling = lastMhi + Math.floor((lastMhi * 3300) / 10_000);
+      expect(cohortData.mhiBps).to.equal(Math.min(deltaCeiling, MHI_CAP_BPS));
+      expect(cohortData.mhiBps).to.be.at.most(MHI_CAP_BPS);
+
       await settleBatch(t, cohort, []);
     });
 

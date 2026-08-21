@@ -126,6 +126,36 @@ pub fn clamp_delta_bps(value: u32, reference: u32, delta_bps: u32) -> u32 {
     }
 }
 
+/// The MHI a submission actually stores: the keeper's reading held inside the
+/// per-cohort delta band, then held under the cohort's payoff cap.
+///
+/// Both bounds clamp instead of rejecting, on purpose. A submitted MHI is an
+/// observation of the market, and the market can print any number; aborting
+/// `submit_mhi` on an out-of-range reading hands a hot market the power to stop
+/// settlement, during exactly the conditions the cap exists to handle. Nothing
+/// downstream needs the rejection: `capped_payoff_bps` truncates payoff at
+/// `cap - strike`, so storing `min(value, cap)` settles every position
+/// identically to storing the raw value, and the instruction still lands.
+///
+/// Order matters. The delta band runs first so the circuit breaker keeps
+/// measuring movement against the previous cohort's stored MHI. The cap runs
+/// last so the stored value can never exceed the cap the cohort's collateral
+/// was locked against, which the delta band alone does not guarantee: after an
+/// authority lowers `mhi_cap_bps`, the band's lower edge can sit above the new
+/// cap.
+///
+/// A `cap_bps` below `MHI_ABSOLUTE_FLOOR_BPS` is a misconfiguration the floor
+/// cannot rescue (a cap under 0.1x leaves no payoff room at any strike); the
+/// cap wins there and the value stored is the cap.
+pub fn effective_mhi_bps(
+    submitted_bps: u32,
+    last_mhi_bps: u32,
+    max_delta_bps: u32,
+    cap_bps: u32,
+) -> u32 {
+    clamp_delta_bps(submitted_bps, last_mhi_bps, max_delta_bps).min(cap_bps)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,5 +415,85 @@ mod tests {
         // upper = 13300, lower = 6700
         assert_eq!(clamp_delta_bps(13_300, 10_000, 3_300), 13_300);
         assert_eq!(clamp_delta_bps(6_700, 10_000, 3_300), 6_700);
+    }
+
+
+    const CAP: u32 = crate::constants::MHI_CAP_BPS_DEFAULT; // 30_000 = 3.0x
+
+    #[test]
+    fn test_effective_mhi_in_band_under_cap_passes_through() {
+        // ref=16_000, delta=33% -> band [10_720, 21_280]; 18_000 is inside it
+        // and under the cap, so nothing touches it.
+        assert_eq!(effective_mhi_bps(18_000, 16_000, 3_300, CAP), 18_000);
+    }
+
+    #[test]
+    fn test_effective_mhi_above_cap_clamps_to_cap() {
+        // No history (ref=0) disables the delta band, so the cap is the only
+        // bound left. This is the first-cohort-after-init case.
+        assert_eq!(effective_mhi_bps(45_000, 0, 3_300, CAP), CAP);
+    }
+
+    #[test]
+    fn test_effective_mhi_delta_binds_before_cap() {
+        // The devnet case that produced MhiExceedsCap (6020): last stored MHI
+        // 16_755, keeper reads a median above 3.0x. The delta band is tighter
+        // than the cap, so the cap never even binds — the old `require!` was
+        // rejecting a value the chain was about to clamp to 22_284 anyway.
+        assert_eq!(effective_mhi_bps(31_500, 16_755, 3_300, CAP), 22_284);
+    }
+
+    #[test]
+    fn test_effective_mhi_cap_binds_when_band_reaches_past_it() {
+        // ref=29_000 -> band upper = 38_570, above the cap. Cap wins.
+        assert_eq!(effective_mhi_bps(45_000, 29_000, 3_300, CAP), CAP);
+    }
+
+    #[test]
+    fn test_effective_mhi_low_submission_still_hits_delta_floor() {
+        // The cap only bounds from above; a collapse submission is still held
+        // by the delta band's lower edge.
+        assert_eq!(effective_mhi_bps(1, 12_680, 3_300, CAP), 8_496);
+    }
+
+    #[test]
+    fn test_effective_mhi_cap_lowered_below_delta_lower_edge() {
+        // Authority lowered mhi_cap_bps to 2.0x while last stored MHI was 4.0x.
+        // The delta band's lower edge (26_800) sits ABOVE the new cap, so
+        // applying the cap last is what keeps the stored value under it.
+        assert_eq!(clamp_delta_bps(20_000, 40_000, 3_300), 26_800);
+        assert_eq!(effective_mhi_bps(20_000, 40_000, 3_300, 20_000), 20_000);
+    }
+
+    #[test]
+    fn test_effective_mhi_cap_below_absolute_floor_is_cap() {
+        // Documented misconfiguration: a cap under MHI_ABSOLUTE_FLOOR_BPS
+        // leaves no payoff room at any strike. The cap still wins, and the
+        // value stays settleable rather than aborting the instruction.
+        let floor = crate::constants::MHI_ABSOLUTE_FLOOR_BPS;
+        assert_eq!(effective_mhi_bps(1, 12_680, 3_300, 500), 500);
+        assert!(500 < floor);
+    }
+
+    #[test]
+    fn test_effective_mhi_never_exceeds_cap() {
+        // The property settle_batch relies on: whatever the keeper submits,
+        // the stored MHI is <= the cohort's cap, so `cap - strike` bounds the
+        // payout for every slot.
+        let refs = [0u32, 1_000, 12_680, 22_284, 29_999, 30_000, 40_000];
+        let submissions = [0u32, 1, 9_999, 30_000, 30_001, 120_000, u32::MAX];
+        for r in refs {
+            for s in submissions {
+                let e = effective_mhi_bps(s, r, 3_300, CAP);
+                assert!(e <= CAP, "effective {e} exceeds cap for submitted={s}, ref={r}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_effective_mhi_disabled_delta_still_capped() {
+        // delta_bps = 0 turns the circuit breaker off. The cap must still hold,
+        // otherwise a config change would reopen the unbounded path.
+        assert_eq!(effective_mhi_bps(u32::MAX, 12_680, 0, CAP), CAP);
     }
 }

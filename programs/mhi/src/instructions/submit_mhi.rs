@@ -3,7 +3,7 @@ use anchor_lang::prelude::*;
 use crate::constants::{COHORT_SEED, EMA_STATE_SEED, GLOBAL_STATE_SEED, NUM_STRIKES, VAULT_SEED};
 use crate::errors::MhiError;
 use crate::events::MhiSubmitted;
-use crate::math::bps::clamp_delta_bps;
+use crate::math::bps::effective_mhi_bps;
 use crate::math::ema::{update_slot_frac_emas, update_strike_anchor};
 use crate::math::premium::{adjust_strike_demand_markup, strike_share_bps};
 use crate::state::{Cohort, CohortStatus, EmaState, GlobalState, Vault};
@@ -85,23 +85,46 @@ pub fn handler(
 
     require!(!cohort.has_mhi(), MhiError::MhiAlreadySubmitted);
 
+    // Zero stays a rejection: it is the keeper saying "no reading", not a
+    // reading of zero, and clamping it would fabricate an index value out of a
+    // data outage. The keeper's own defer path handles a missing MHI (it waits,
+    // then flags the cohort for void); the chain must not paper over it.
     require!(mhi_bps > 0, MhiError::MhiZero);
-    // Validate against both the cohort's at-start cap (settlement uses that)
-    // AND the current global cap (which the keeper's UI is quoting against).
-    // If the authority *lowered* the cap mid-flight, the cohort still settles
-    // against its higher original cap — but submissions must respect the new
-    // cap so the keeper's UX stays consistent with config.
-    require!(mhi_bps <= mhi_cap_bps, MhiError::MhiExceedsCap);
-    require!(mhi_bps <= global_mhi_cap_bps, MhiError::MhiExceedsCap);
     require!(
         token_count >= crate::constants::MIN_COHORT_TOKENS,
         MhiError::InvalidConfig
     );
 
-    // Drift-style clamp. The keeper submits any value, we clamp to ±delta from
-    // the previous cohort's MHI (with an absolute floor). The clamped value is
-    // what we record and feed into anchor/EMA updates — never the raw input.
-    let effective_mhi = clamp_delta_bps(mhi_bps, last_mhi_bps, mhi_max_delta_bps);
+    // Drift-style clamp, then the cap. The keeper submits any value; we hold it
+    // inside ±delta of the previous cohort's MHI (with an absolute floor) and
+    // under this cohort's cap. The resulting value is what we record and feed
+    // into anchor/EMA updates — never the raw input.
+    //
+    // The cap used to be `require!(mhi_bps <= cap)`, which made a hot market
+    // able to stop settlement: every submission above 3.0x reverted with
+    // MhiExceedsCap, the cohort never got its MHI, and the keeper retried until
+    // the median came back down while its active_cohorts slot stayed occupied.
+    // Rejecting bought nothing, because `capped_payoff_bps` already truncates
+    // payoff at `cap - strike` — a stored `min(value, cap)` settles every
+    // position identically to the raw value. The bound the protocol actually
+    // relies on against a lying keeper is the delta band, which still applies.
+    //
+    // The cap is the COHORT's at-start snapshot, not the live global cap: an
+    // authority that lowers `mhi_cap_bps` mid-flight must not cut payoffs for
+    // positions already priced and collateralized against the higher one. The
+    // keeper clamps to the live global cap on its side, which is where that
+    // config-consistency concern belongs.
+    let effective_mhi = effective_mhi_bps(mhi_bps, last_mhi_bps, mhi_max_delta_bps, mhi_cap_bps);
+    if effective_mhi != mhi_bps {
+        msg!(
+            "mhi clamped: submitted={} stored={} (last={} delta_bps={} cap={})",
+            mhi_bps,
+            effective_mhi,
+            last_mhi_bps,
+            mhi_max_delta_bps,
+            mhi_cap_bps
+        );
+    }
 
     cohort.status = CohortStatus::Measuring;
     cohort.mhi_bps = effective_mhi;

@@ -69,13 +69,19 @@ pub struct Cohort {
     /// Number of vault positions voided (for batchable void_cohort)
     pub positions_voided: u32,
 
-    /// Count of Position PDAs still alive (incremented on buy_call,
-    /// decremented when the PDA is closed by claim or expire_position).
-    /// close_cohort requires this to be zero to prevent bricking unclaimed positions.
+    /// Count of vault positions whose TERMINAL STATE is still unresolved:
+    /// incremented on buy_call, decremented when settle_batch settles the
+    /// position or void_cohort voids it.
+    ///
+    /// NOT a count of live PDAs. Settlement pays out atomically and leaves the
+    /// Position PDA alive holding rent, so this reaching zero says every
+    /// position is resolved, not that every PDA is gone. close_cohort gates on
+    /// that weaker property on purpose — see the comment there. The leftover
+    /// PDAs are retired separately by close_position.
     pub outstanding_positions: u32,
 
-    /// Count of P2pPosition PDAs still alive. Same lifecycle as outstanding_positions
-    /// but for the P2P side.
+    /// Count of P2P positions whose terminal state is still unresolved. Same
+    /// lifecycle and same PDA-vs-state caveat as outstanding_positions.
     pub outstanding_p2p_positions: u32,
 
     /// Per-slot strikes for this cohort (BPS), set by start_cohort. Computed
@@ -159,8 +165,9 @@ impl Cohort {
         self.total_positions == 0 && self.p2p_positions == 0
     }
 
-    /// Returns true when every position PDA derived from this cohort has been
-    /// closed (via claim or expire). close_cohort uses this as its safety gate.
+    /// Returns true when every position derived from this cohort has reached a
+    /// terminal state (settled or voided). close_cohort uses this as its safety
+    /// gate. Their PDAs may still exist — see `outstanding_positions`.
     pub fn is_quiescent(&self) -> bool {
         self.outstanding_positions == 0 && self.outstanding_p2p_positions == 0
     }

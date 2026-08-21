@@ -666,29 +666,15 @@ describe.skip("mhi protocol - edge cases", () => {
       }
     });
 
-    it("rejects mhi_bps > cap", async () => {
-      try {
-        await program.methods
-          .submitMhi(30_001, 20, Array.from({ length: 32 }, () => 0))
-          .accounts({
-            keeper: keeper.publicKey,
-            globalState: globalStatePda,
-            cohort: cohortPda,
-            emaState: emaStatePda,
-            vault: vaultPda,
-          } as any)
-          .signers([keeper])
-          .rpc();
-        expect.fail("Should have thrown");
-      } catch (err: any) {
-        expect(err.toString()).to.include("MhiExceedsCap");
-      }
-    });
+    it("clamps mhi_bps > cap instead of rejecting it", async () => {
+      // A reading above the cap is a market observation, not a keeper fault.
+      // Rejecting it stopped settlement while the market was hot; the stored
+      // value is bounded instead, which settle_batch already assumed.
+      const gs: any = await program.account.globalState.fetch(globalStatePda);
+      const capBps = gs.mhiCapBps as number;
 
-    after(async () => {
-      // Clean up: submit valid MHI and settle empty cohort
       await program.methods
-        .submitMhi(12_000, 20, Array.from({ length: 32 }, () => 0))
+        .submitMhi(capBps + 30_000, 20, Array.from({ length: 32 }, () => 0))
         .accounts({
           keeper: keeper.publicKey,
           globalState: globalStatePda,
@@ -698,6 +684,15 @@ describe.skip("mhi protocol - edge cases", () => {
         } as any)
         .signers([keeper])
         .rpc();
+
+      const cohort: any = await program.account.cohort.fetch(cohortPda);
+      expect(cohort.mhiBps).to.be.greaterThan(0);
+      expect(cohort.mhiBps).to.be.at.most(capBps);
+    });
+
+    after(async () => {
+      // Clean up: settle the empty cohort. The MHI is already on it from the
+      // clamp test above, so re-submitting would hit MhiAlreadySubmitted.
       await program.methods
         .settleBatch()
         .accounts({
