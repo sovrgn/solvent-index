@@ -102,13 +102,25 @@ pub fn handler<'info>(
         .position(|&s| s == strike_bps)
         .ok_or(MhiError::InvalidStrike)?;
 
-    // Fair payoff: max(fast_frac, slow_frac) * current_anchor / BPS_DENOM.
-    // Uses the CURRENT global anchor (not the cohort snapshot) so quotes
-    // track anchor moves caused by later cohorts settling during this one's
-    // trading window.
+    // Fair payoff: max(fast_frac, slow_frac) * cohort_anchor / BPS_DENOM.
+    //
+    // The anchor MUST be this cohort's `strike_anchor_bps_at_start`, because
+    // that is the value its strike ladder was derived from and the same value
+    // `update_slot_ema` divides by when it records a settlement. The stored
+    // frac is payoff-as-a-fraction-of-the-anchor-the-strikes-were-built-on, so
+    // multiplying it by any other anchor prices a ladder that doesn't exist:
+    // with three cohorts trading at once, the live global anchor would charge
+    // every cohort the same bps for slot i even though their strikes sit at
+    // different distances from the index.
+    //
+    // Recency is not lost by pinning the scale — `fast_frac` / `slow_frac`
+    // still move on every settlement inside this cohort's trading window, so
+    // the quote keeps tracking the payoff distribution. What stops moving is
+    // the scale factor, which is what the off-chain quote is built on too.
     let ema = &ctx.accounts.ema_state;
     let slot = &ema.slots[strike_idx];
-    let fair_bps = fair_payoff_bps(slot.fast_frac_bps, slot.slow_frac_bps, gs.strike_anchor_bps)
+    let cohort_anchor_bps = cohort_ref.strike_anchor_bps_at_start;
+    let fair_bps = fair_payoff_bps(slot.fast_frac_bps, slot.slow_frac_bps, cohort_anchor_bps)
         .ok_or(MhiError::Overflow)?;
 
     // Layer 1: Base option-premium markup with cold-start amplification.

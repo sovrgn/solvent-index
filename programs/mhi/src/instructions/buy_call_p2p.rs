@@ -164,9 +164,14 @@ pub fn handler(
         require!(p2p_new_locked <= p2p_max_cohort, MhiError::P2pRiskCapExceeded);
     }
 
+    // Same anchor rule as `buy_call`: the stored frac is payoff relative to
+    // the anchor this cohort's strikes were derived from, so it has to be
+    // scaled back by that same snapshot. A P2P fill and a vault fill on the
+    // same (cohort, strike, size) must quote identically.
     let ema = &ctx.accounts.ema_state;
     let slot = &ema.slots[strike_idx];
-    let fair_bps = fair_payoff_bps(slot.fast_frac_bps, slot.slow_frac_bps, gs.strike_anchor_bps)
+    let cohort_anchor_bps = ctx.accounts.cohort.strike_anchor_bps_at_start;
+    let fair_bps = fair_payoff_bps(slot.fast_frac_bps, slot.slow_frac_bps, cohort_anchor_bps)
         .ok_or(MhiError::Overflow)?;
 
     let cold_base_markup = cold_start_markup(EMA_BASE_MARKUP_BPS, gs.total_cohorts)
